@@ -13,6 +13,7 @@ import torchvision.transforms as transforms
 from utils.DataLoad import load_data, data_transform
 from utils.TrainTest import model_train, model_val, model_test
 from model.ConvNeXt import convnext_1
+import os
 
 def parameter_setting():
     # argparse settings
@@ -90,6 +91,10 @@ if __name__ == '__main__':
     
     # 保存模型状态
     save_path = './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_ConvNeXt.pth'
+    
+    # 确保保存目录存在
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
     if isinstance(model, torch.nn.DataParallel):
         torch.save(model.module.state_dict(), save_path)
     else:
