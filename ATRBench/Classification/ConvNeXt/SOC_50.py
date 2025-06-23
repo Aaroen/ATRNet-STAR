@@ -30,7 +30,7 @@ def parameter_setting():
                         help='input batch size for training')
     parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate')
-    parser.add_argument('--fold', type=int, default=1,
+    parser.add_argument('--fold', type=int, default=6,
                         help='K-fold')
     parser.add_argument('--seed', type=int, default=0,
                         help='random seed (default: 1)')
@@ -69,34 +69,48 @@ if __name__ == '__main__':
         opt = torch.optim.AdamW(model.parameters(), lr=arg.lr, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=arg.epochs)
         best_test_accuracy = 0
+        best_epoch = 0
+        save_path = './Model/' + re.split(r'[/\\]', arg.data_path)[-2] + '_ConvNeXt.pth'
+
         for epoch in range(1, arg.epochs + 1):
             print("##### " + str(k_F + 1) + " EPOCH " + str(epoch) + "#####")
-            loss = model_train(model=model, data_loader=train_loader, opt=opt, sch=scheduler)
-        accuracy = model_val(model, test_loader)
-        print("Val Accuracy is:{:.2f} %: ".format(accuracy))
+            model_train(model=model, data_loader=train_loader, opt=opt, sch=scheduler)
+            
+            # 在每个 epoch 之后进行验证
+            accuracy = model_val(model, test_loader)
+            print("--- Epoch {} Val Accuracy is: {:.2f} % ---".format(epoch, accuracy))
 
-        # if best_test_accuracy <= accuracy:
-        #     best_epoch = epoch
-        #     best_test_accuracy = accuracy
+            # 检查并保存最佳模型
+            if best_test_accuracy <= accuracy:
+                best_epoch = epoch
+                best_test_accuracy = accuracy
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                if isinstance(model, torch.nn.DataParallel):
+                    torch.save(model.module.state_dict(), save_path)
+                else:
+                    torch.save(model.state_dict(), save_path)
+                print(f"*** New best model saved at epoch {best_epoch} with accuracy {best_test_accuracy:.2f}% ***")
+
+    # 加载最佳模型进行最终测试
+    print(f"\nLoading best model from epoch {best_epoch} for final test...")
+    if os.path.exists(save_path):
+        # 加载最佳模型的权重到当前模型结构
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.load_state_dict(torch.load(save_path))
+        else:
+            model.load_state_dict(torch.load(save_path))
+    else:
+        print("Warning: Best model file not found. Testing with the model from the last epoch.")
+
 
     acc = model_test(model, test_loader)
     print('test accuracy is {}'.
       format(acc))
     history['accuracy'].append(acc)
-    print('The best epoch is {}, val accuracy is {}, test accuracy is {}'.
-          format(epoch, best_test_accuracy, acc))
+    print('The best epoch is {}, best val accuracy is {}, final test accuracy is {}'.
+          format(best_epoch, best_test_accuracy, acc))
 
     print('OA is {}, STD is {}'.format(np.mean(history['accuracy']), np.std(history['accuracy'])))
     print(history['accuracy'])
     
-    # 保存模型状态
-    save_path = './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_ConvNeXt.pth'
-    
-    # 确保保存目录存在
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    if isinstance(model, torch.nn.DataParallel):
-        torch.save(model.module.state_dict(), save_path)
-    else:
-        torch.save(model.state_dict(), save_path)
-    print(f"模型已保存至: {save_path}")
+    print(f"Best model checkpoint is saved at: {save_path}")
