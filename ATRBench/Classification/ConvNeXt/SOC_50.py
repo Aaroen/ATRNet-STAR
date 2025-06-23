@@ -17,10 +17,10 @@ from model.ConvNeXt import convnext_1
 def parameter_setting():
     # argparse settings
     parser = argparse.ArgumentParser(description='Origin Input')
-    parser.add_argument('--data_path', type=str, default="../地距/SOC_50classes/",
+    parser.add_argument('--data_path', type=str, default="../../datasets/SOC_50classes/",
                         help='where data is stored')
-    parser.add_argument('--GPU_ids', type=int, default=0,
-                        help='GPU ids')
+    parser.add_argument('--GPU_ids', type=str, default='0,1',
+                        help='GPU ids, comma-separated (e.g., 0,1)')
     parser.add_argument('--epochs', type=int, default=50,
                         help='number of epochs to train')
     parser.add_argument('--classes', type=int, default=50,
@@ -38,14 +38,16 @@ def parameter_setting():
 
 if __name__ == '__main__':
     arg = parameter_setting()
-    torch.cuda.set_device(arg.GPU_ids)
+    # 解析 GPU IDs
+    gpu_ids = [int(id) for id in arg.GPU_ids.split(',')]
+    # 设置主设备
+    device = torch.device(f"cuda:{gpu_ids[0]}" if torch.cuda.is_available() else "cpu")
     # torch.manual_seed(arg.seed)
     # torch.cuda.manual_seed(arg.seed)
     history = collections.defaultdict(list)  # 记录每一折的各种指标
 
     train_all = load_data(arg.data_path + 'train', data_transform)
     test_set = load_data(arg.data_path + 'test', data_transform)
-    torch.cuda.set_device(arg.GPU_ids)
     for k_F in tqdm(range(arg.fold)):
         # train_set, val_set = torch.utils.data.random_split(train_all, [len(train_all) - int(len(train_all) / arg.fold),
         #                                                                int(len(train_all) / arg.fold)])
@@ -55,6 +57,11 @@ if __name__ == '__main__':
         # print('train shape:{}, val shape{}, test shape{}'.format(len(train_loader.dataset), len(val_loader.dataset),
         #                                                          len(test_loader.dataset)))
         model = convnext_1(arg.classes)
+
+        # 为多卡训练包装模型
+        if torch.cuda.is_available() and len(gpu_ids) > 1:
+            model = nn.DataParallel(model, device_ids=gpu_ids)
+        model.to(device)
 
         # opt = torch.optim.SGD(model.parameters(), momentum=0.9, lr=arg.lr, weight_decay=4e-3)
         # opt = torch.optim.Adam(model.parameters(), lr=arg.lr, weight_decay=0.004)
@@ -80,10 +87,11 @@ if __name__ == '__main__':
 
     print('OA is {}, STD is {}'.format(np.mean(history['accuracy']), np.std(history['accuracy'])))
     print(history['accuracy'])
-    # torch.save(model.state_dict(), './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '.pth')
-    # np.save('./results/' + re.split('[/\\\]', arg.data_path)[-2] + '_result.npy', history)
-    # torch.save(model.state_dict(), './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_Unet.pth')
-    # if isinstance(model, torch.nn.DataParallel):
-    #     torch.save(model.module.state_dict(), './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_Unet.pth')
-    # else:
-    #     torch.save(model.state_dict(), './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_Unet.pth')
+    
+    # 保存模型状态
+    save_path = './Model/' + re.split('[/\\\]', arg.data_path)[-2] + '_ConvNeXt.pth'
+    if isinstance(model, torch.nn.DataParallel):
+        torch.save(model.module.state_dict(), save_path)
+    else:
+        torch.save(model.state_dict(), save_path)
+    print(f"模型已保存至: {save_path}")
