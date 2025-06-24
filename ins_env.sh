@@ -15,7 +15,7 @@ echo ">>> 步骤 1/3: 正在检查并创建 Conda 环境 '$ENV_NAME'..."
 if conda info --envs | grep -q "^$ENV_NAME\s"; then
     echo "--- 环境 '$ENV_NAME' 已存在，跳过创建。 ---"
 else
-    conda create -n $ENV_NAME python=3.11 -y
+conda create -n $ENV_NAME python=3.11 -y
     echo "--- 环境 '$ENV_NAME' 创建成功。 ---"
 fi
 echo

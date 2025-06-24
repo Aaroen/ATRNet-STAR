@@ -82,59 +82,102 @@ def model_train(model, data_loader, opt, sch):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
-    train_acc = 0
     cr1 = nn.CrossEntropyLoss()
     correct = 0
+    total_loss = 0
+    total = 0
 
-    train_loss, train_loss1, train_loss2, train_loss3, train_loss4 = 0, 0, 0, 0, 0
-    for i, data in enumerate(data_loader):
-        x, y = data
-        y = y.cuda()
-        output = model(x.cuda())
-        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        correct += pred.eq(y.view_as(pred)).sum().item()
-
-        loss = cr1(output, y.to(device))
+    # 使用tqdm的动态进度条，设置position=0确保在同一行更新
+    progress_bar = tqdm(data_loader, desc="Training", ncols=100, position=0, leave=True)
+    
+    for i, (x, y) in enumerate(progress_bar):
+        x, y = x.to(device), y.to(device)
+        batch_size = y.size(0)
+        total += batch_size
+        
+        output = model(x)
+        loss = cr1(output, y)
+        
         opt.zero_grad()
         loss.backward()
         opt.step()
-        sch.step()
-    print("Train Accuracy is:{:.2f} %: ".format(100. * correct / len(data_loader.dataset)))
+        
+        pred = output.max(1, keepdim=True)[1]
+        batch_correct = pred.eq(y.view_as(pred)).sum().item()
+        correct += batch_correct
+        total_loss += loss.item()
+        
+        # 更新进度条信息
+        current_acc = 100. * correct / total
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            acc=f"{current_acc:.2f}%"
+        )
+    
+    # 每个epoch结束后更新学习率
+    sch.step()
+    
+    # 最终的训练精度和损失
+    avg_loss = total_loss / len(data_loader)
+    accuracy = 100. * correct / total
+    print(f"Train Accuracy is: {accuracy:.2f}%, Average Loss: {avg_loss:.4f}")
     return
-
-def model_test(model, test_loader):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    test_loss = 0
-    correct = 0
-    pred_all = np.array([[]]).reshape((0, 1))
-    real_all = np.array([[]]).reshape((0, 1))
-    model.eval()
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    # print("Test Accuracy is:{:.2f} %: ".format(100. * correct / len(test_loader.dataset)))
-    return 100. * correct / len(test_loader.dataset)
 
 def model_val(model, test_loader):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     test_loss = 0
     correct = 0
-    pred_all = np.array([[]]).reshape((0, 1))
-    real_all = np.array([[]]).reshape((0, 1))
+    total = 0
     model.eval()
+    
+    # 使用简洁的进度条
+    progress_bar = tqdm(test_loader, desc="Validation", ncols=100, position=0, leave=True)
+    
     with torch.no_grad():
-        for data, target in test_loader:
-            target = target.to(device)
-            # data = augment_fn(data)
-            data = data.to(device)
+        for data, target in progress_bar:
+            data, target = data.to(device), target.to(device)
+            batch_size = target.size(0)
+            total += batch_size
+            
             output = model(data)
-            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    # print("Test Accuracy is:{:.2f} %: ".format(100. * correct / len(test_loader.dataset)))
-    return 100. * correct / len(test_loader.dataset)
+            pred = output.max(1, keepdim=True)[1]
+            batch_correct = pred.eq(target.view_as(pred)).sum().item()
+            correct += batch_correct
+            
+            # 更新进度条信息
+            current_acc = 100. * correct / total
+            progress_bar.set_postfix(acc=f"{current_acc:.2f}%")
+    
+    final_acc = 100. * correct / total
+    return final_acc
+
+def model_test(model, test_loader):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    test_loss = 0
+    correct = 0
+    total = 0
+    model.eval()
+    
+    # 使用简洁的进度条
+    progress_bar = tqdm(test_loader, desc="Testing", ncols=100, position=0, leave=True)
+    
+    with torch.no_grad():
+        for data, target in progress_bar:
+            data, target = data.to(device), target.to(device)
+            batch_size = target.size(0)
+            total += batch_size
+            
+            output = model(data)
+            pred = output.max(1, keepdim=True)[1]
+            batch_correct = pred.eq(target.view_as(pred)).sum().item()
+            correct += batch_correct
+            
+            # 更新进度条信息
+            current_acc = 100. * correct / total
+            progress_bar.set_postfix(acc=f"{current_acc:.2f}%")
+    
+    final_acc = 100. * correct / total
+    return final_acc
 
