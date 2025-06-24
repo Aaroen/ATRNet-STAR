@@ -6,7 +6,6 @@ import re
 from tqdm import tqdm
 import argparse
 import torch.nn as nn
-
 import collections
 from functools import partial
 import torchvision.transforms as transforms
