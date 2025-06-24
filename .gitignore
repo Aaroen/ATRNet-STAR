@@ -1,0 +1,31 @@
+# 忽略所有 PyTorch 模型文件
+*.pt
+*.pth
+
+# 忽略所有 TensorFlow/Keras 模型文件
+*.h5
+*.keras
+saved_model/ # 忽略整个 TensorFlow saved model 目录
+
+# 忽略所有 ONNX 模型文件
+*.onnx
+
+# 忽略所有 Checkpoint 文件（例如，训练过程中的保存点）
+*.ckpt
+checkpoints/ # 忽略名为 'checkpoints' 的目录
+models/      # 忽略名为 'models' 的目录 (常用作存放训练好的模型)
+output/models/ # 忽略 'output' 目录下的 'models' 目录
+
+# 忽略大型二进制模型文件（例如，transformers 库中的 safetensors, bin 文件）
+*.bin
+*.safetensors
+
+# 如果你的模型文件都在一个特定的文件夹里，例如叫做 `my_large_models`
+my_large_models/
+
+# 如果你有一些临时生成但不需要跟踪的文件
+*.tmp
+*.log
+
+# 忽略 Jupyter notebook 的检查点目录
+.ipynb_checkpoints/
