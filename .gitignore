@@ -1,3 +1,9 @@
+# 忽略 Python 缓存和编译文件 (根据您的截图补充)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # 忽略所有 PyTorch 模型文件
 *.pt
 *.pth
@@ -29,3 +35,9 @@ my_large_models/
 
 # 忽略 Jupyter notebook 的检查点目录
 .ipynb_checkpoints/
+
+# 忽略特定于 IDE 和操作系统的文件
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
