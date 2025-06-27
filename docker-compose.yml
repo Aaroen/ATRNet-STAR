@@ -1,0 +1,33 @@
+services:
+  # 服务名，现在是统一的命名
+  aroen_atrbench:
+    # 构建当前目录的 Dockerfile
+    build: .
+    
+    # 构建后镜像的名字
+    image: aroen_atrbench:latest
+    
+    # 容器名
+    container_name: aroen_atrbench
+
+    # 主机名
+    hostname: aroen_atrbench
+
+    # 重启策略
+    restart: unless-stopped
+
+    # 共享内存
+    shm_size: '64g'
+
+    # GPU 运行时
+    runtime: nvidia
+
+    # 挂载卷
+    volumes:
+      - /mnt/E2EC7346EC73144F/AroenLan:/AroenLan
+      - ~/.gitconfig:/root/.gitconfig:ro
+      - ~/.ssh:/root/.ssh:ro
+      
+    # 交互式运行
+    stdin_open: true
+    tty: true
