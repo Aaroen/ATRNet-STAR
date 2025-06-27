@@ -29,17 +29,17 @@ def parameter_setting():
                         help='where data is stored')
     parser.add_argument('--GPU_ids', type=str, default='0,1',
                         help='GPU ids, comma-separated (e.g., 0,1)')
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--epochs', type=int, default=30,
                         help='number of epochs to train')
     parser.add_argument('--classes', type=int, default=50,
                         help='number of classes')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=168,
                         help='input batch size for training')
     parser.add_argument('--workers', type=int, default=4,
                         help='number of data loading workers')
     parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate')
-    parser.add_argument('--fold', type=int, default=1,
+    parser.add_argument('--fold', type=int, default=3,
                         help='K-fold')
     parser.add_argument('--seed', type=int, default=0,
                         help='random seed (default: 1)')
