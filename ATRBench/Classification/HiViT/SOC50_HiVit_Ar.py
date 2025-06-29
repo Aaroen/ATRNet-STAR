@@ -60,7 +60,7 @@ def reduce_value(value, average=True):
 
 def parameter_setting():
     """参数设置函数"""
-    parser = argparse.ArgumentParser(description='最终优化版 HiViT 训练脚本')
+    parser = argparse.ArgumentParser(description='HiViT UpUp')
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
@@ -81,7 +81,7 @@ def parameter_setting():
     # --- 正则化与早停参数 ---
     parser.add_argument('--head_drop_rate', type=float, default=0.5, help='分类头 Dropout 比率')
     parser.add_argument('--drop_path_rate', type=float, default=0.2, help='Stochastic Depth / DropPath 比率')
-    parser.add_argument('--patience', type=int, default=50, help='早停: 验证集性能无提升的等待轮数')
+    parser.add_argument('--patience', type=int, default=30, help='早停: 验证集性能无提升的等待轮数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     # --- 训练稳定性参数 ---
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')

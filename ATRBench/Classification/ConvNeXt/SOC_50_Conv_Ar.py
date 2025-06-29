@@ -60,7 +60,7 @@ def reduce_value(value, average=True):
 
 def parameter_setting():
     """参数设置函数"""
-    parser = argparse.ArgumentParser(description='最终优化版 ConvNeXt 训练脚本')
+    parser = argparse.ArgumentParser(description='ConvNeXt Up')
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
@@ -78,7 +78,7 @@ def parameter_setting():
     parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减')
     
     # --- 正则化与早停参数 ---
-    parser.add_argument('--patience', type=int, default=50, help='早停: 验证集性能无提升的等待轮数')
+    parser.add_argument('--patience', type=int, default=30, help='早停: 验证集性能无提升的等待轮数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     
     # --- 训练稳定性参数 ---
@@ -173,7 +173,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/ConvNeXt_Final_Optimized')
+        writer = SummaryWriter('runs/ConvNeXt_Up')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
