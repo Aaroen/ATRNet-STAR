@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import sys
 import torch
 import numpy as np
@@ -70,18 +69,19 @@ def parameter_setting():
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像尺寸')
-    parser.add_argument('--folds', type=int, default=1, help='交叉验证折数')
     
     # --- 学习率与优化器参数 ---
     parser.add_argument('--lr', type=float, default=5e-4, help='学习率')
     parser.add_argument('--warmup_epochs', type=int, default=20, help='预热轮数')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='最低学习率')
     parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减')
+    parser.add_argument('--T_0', type=int, default=15, help='余弦退火调度器的初始周期长度 (epochs)')
+    parser.add_argument('--T_mult', type=int, default=2, help='余弦退火周期增长的乘数')
     
     # --- 正则化与早停参数 ---
     parser.add_argument('--head_drop_rate', type=float, default=0.5, help='分类头 Dropout 比率')
     parser.add_argument('--drop_path_rate', type=float, default=0.2, help='Stochastic Depth / DropPath 比率')
-    parser.add_argument('--patience', type=int, default=30, help='早停: 验证集性能无提升的等待轮数')
+    parser.add_argument('--patience_cycles', type=int, default=2, help='早停: 验证集性能无提升的等待学习率周期数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     # --- 训练稳定性参数 ---
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
@@ -93,6 +93,7 @@ def parameter_setting():
     
     # --- DDP 相关参数 ---
     parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
+    parser.add_argument('--resume', default='', type=str, help='要恢复训练的检查点路径')
     
     args = parser.parse_args()
     return args
@@ -207,7 +208,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/HiViT_Final_Optimized')
+        writer = SummaryWriter('runs/HiViT_Up_CoaW')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -223,109 +224,151 @@ if __name__ == '__main__':
     dataset_size = len(full_train_dataset)
     indices = list(range(dataset_size))
     np.random.shuffle(indices)
-    folds_indices = np.array_split(indices, arg.folds)
-    fold_results = []
+    
+    # K-Fold 数据划分
+    val_split = 0.2
+    split_idx = int(np.floor(val_split * dataset_size))
+    train_indices, val_indices = indices[split_idx:], indices[:split_idx]
 
-    for fold_idx in range(arg.folds):
-        if arg.rank == 0:
-            print(f"\n===== Fold {fold_idx + 1}/{arg.folds} =====")
+    train_set = Subset(full_train_dataset, train_indices)
+    val_set = Subset(val_dataset_for_val_transform, val_indices)
 
-        # K-Fold 数据划分
-        if arg.folds <= 1:
-            split_idx = int(0.8 * dataset_size)
-            train_indices, val_indices = indices[:split_idx], indices[split_idx:]
-        else:
-            val_indices = folds_indices[fold_idx].tolist()
-            train_indices = list(itertools.chain.from_iterable([folds_indices[i] for i in range(arg.folds) if i != fold_idx]))
+    train_sampler = DistributedSampler(train_set) if arg.distributed else None
+    val_sampler = DistributedSampler(val_set, shuffle=False) if arg.distributed else None
 
-        train_set = Subset(full_train_dataset, train_indices)
-        val_set = Subset(val_dataset_for_val_transform, val_indices)
+    train_loader = DataLoader(train_set, batch_size=arg.batch_size, sampler=train_sampler, num_workers=arg.workers, pin_memory=True, shuffle=(train_sampler is None))
+    val_loader = DataLoader(val_set, batch_size=arg.batch_size, sampler=val_sampler, num_workers=arg.workers, pin_memory=True)
 
-        train_sampler = DistributedSampler(train_set)
-        val_sampler = DistributedSampler(val_set, shuffle=False)
+    if arg.rank == 0:
+        print(f"训练集: {len(train_set)}, 验证集: {len(val_set)}, 测试集: {len(test_set)}")
 
-        train_loader = DataLoader(train_set, batch_size=arg.batch_size, sampler=train_sampler, num_workers=arg.workers, pin_memory=True)
-        val_loader = DataLoader(val_set, batch_size=arg.batch_size, sampler=val_sampler, num_workers=arg.workers, pin_memory=True)
-
-        # 创建模型（HiViT_base 只接受 classes 一个参数）
-        model = HiViT_base(classes=arg.classes).to(device)
-        
-        #加载预训练权重
-        if arg.pretrained_weights_url:
-            load_pretrained_weights(model, arg.pretrained_weights_url, arg.classes)
-        
-        # DDP 包装
+    # 创建模型（HiViT_base 只接受 classes 一个参数）
+    model = HiViT_base(classes=arg.classes).to(device)
+    
+    #加载预训练权重
+    if arg.pretrained_weights_url:
+        load_pretrained_weights(model, arg.pretrained_weights_url, arg.classes)
+    
+    # DDP 包装
+    if arg.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[arg.gpu])
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.warmup_epochs, T_mult=2, eta_min=arg.min_lr)
-        scaler = amp.GradScaler()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
+    
+    # --- 创建 "预热 + 余弦退火" 学习率调度器 ---
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.T_0, T_mult=arg.T_mult, eta_min=arg.min_lr)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
 
-        dataset_name = os.path.basename(os.path.normpath(arg.data_path))
-        best_ckpt_path = os.path.join('./results/', f'{dataset_name}_HiViT_fold{fold_idx+1}_best.pth')
+    scaler = amp.GradScaler()
+
+    dataset_name = os.path.basename(os.path.normpath(arg.data_path))
+    best_ckpt_path = os.path.join('./results/', f'{dataset_name}_HiViT_best.pth')
+    
+    start_epoch = 1
+    best_val_acc, best_epoch = 0, 0
+    cycles_no_improve = 0
+    best_acc_at_last_cycle_check = 0.0
+
+    if arg.resume and os.path.exists(arg.resume):
+        print(f"=> 正在加载检查点: '{arg.resume}'")
+        checkpoint = torch.load(arg.resume, map_location=device)
+        model_to_load = model.module if arg.distributed else model
         
-        best_val_acc, best_epoch, epochs_no_improve = 0, 0, 0
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model_to_load.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_acc = checkpoint['best_val_acc']
+            best_epoch = checkpoint['epoch']
+            cycles_no_improve = checkpoint.get('cycles_no_improve', 0)
+            best_acc_at_last_cycle_check = checkpoint.get('best_acc_at_last_cycle_check', 0.0)
+            print(f"=> 已加载检查点 '{arg.resume}' (从 epoch {start_epoch} 开始)")
+        else:
+            model_to_load.load_state_dict(checkpoint)
+            print(f"=> 已从旧格式检查点 '{arg.resume}' 加载模型权重。")
 
-        for epoch in range(1, arg.epochs + 1):
-            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
-            val_acc = evaluate(model, val_loader, criterion, device, arg)
-            scheduler.step()
+    for epoch in range(start_epoch, arg.epochs + 1):
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
+        val_acc = evaluate(model, val_loader, criterion, device, arg)
+        scheduler.step()
 
-            if arg.rank == 0:
-                print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
-                
-                # 根据是否启用交叉验证，决定 TensorBoard tag 的名称
-                train_acc_tag = f'Accuracy/train_fold{fold_idx+1}' if arg.folds > 1 else 'Accuracy/train'
-                val_acc_tag = f'Accuracy/val_fold{fold_idx+1}' if arg.folds > 1 else 'Accuracy/validation'
-                loss_tag = f'Loss/train_fold{fold_idx+1}' if arg.folds > 1 else 'Loss/train'
-                lr_tag = f'Learning_Rate/fold{fold_idx+1}' if arg.folds > 1 else 'Learning_Rate'
-
-                writer.add_scalar(train_acc_tag, train_acc, epoch)
-                writer.add_scalar(val_acc_tag, val_acc, epoch)
-                writer.add_scalar(loss_tag, train_loss, epoch)
-                writer.add_scalar(lr_tag, optimizer.param_groups[0]['lr'], epoch)
-
-                # --- 检查早停条件 ---
-                # 1. 基于验证集性能
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    best_epoch = epoch
-                    epochs_no_improve = 0
-                    torch.save(model.module.state_dict(), best_ckpt_path)
-                    print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
-                else:
-                    epochs_no_improve += 1
-
-                if epochs_no_improve >= arg.patience:
-                    print(f"连续 {arg.patience} 轮验证集性能未提升，触发早停。")
-                    break
-                
-                # 2.基于训练/验证集差距
-                if epoch > arg.warmup_epochs and (train_acc - val_acc > arg.overfit_gap_threshold):
-                    print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
-                    break
-
-        dist.barrier()
-
-        # --- 测试 ---
         if arg.rank == 0:
-            print(f"\n--- Fold {fold_idx + 1} 结束, 使用 Epoch {best_epoch} 的最佳模型测试 ---")
-            if os.path.exists(best_ckpt_path):
-                test_model = HiViT_base(classes=arg.classes).to(device)
-                test_model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
-                test_loader_single = DataLoader(test_set, batch_size=arg.batch_size, shuffle=False, num_workers=arg.workers)
-                test_acc = model_test(test_model, test_loader_single)
-                print(f"[Fold {fold_idx+1}] 最终测试 OA: {test_acc:.2f}%")
-                fold_results.append(test_acc)
-            else:
-                print("[Fold] 未找到最佳模型文件，跳过测试。")
+            print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
+            
+            writer.add_scalar('Accuracy/train', train_acc, epoch)
+            writer.add_scalar('Accuracy/validation', val_acc, epoch)
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+
+            # --- 检查早停条件 ---
+            # 1. 基于验证集性能保存最佳模型
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_epoch = epoch
+                
+                model_to_save = model.module if arg.distributed else model
+                save_dict = {
+                    'epoch': epoch,
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'best_val_acc': best_val_acc,
+                    'cycles_no_improve': cycles_no_improve,
+                    'best_acc_at_last_cycle_check': best_acc_at_last_cycle_check
+                }
+                torch.save(save_dict, best_ckpt_path)
+                print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
+
+            # 2. 基于学习率周期的早停
+            if epoch > arg.warmup_epochs:
+                # 通过判断当前学习率是否到达最小值来确定周期结束，这是一个更稳健的方法
+                current_lr = optimizer.param_groups[0]['lr']
+                if abs(current_lr - arg.min_lr) < 1e-8:
+                    print(f"--- Cycle ended at epoch {epoch}. Current best acc: {best_val_acc:.2f}%. Best at last check: {best_acc_at_last_cycle_check:.2f}% ---")
+                    if best_val_acc > best_acc_at_last_cycle_check:
+                        cycles_no_improve = 0
+                        best_acc_at_last_cycle_check = best_val_acc
+                        print("--- Accuracy improved. Resetting early stopping counter. ---")
+                    else:
+                        cycles_no_improve += 1
+                        print(f"--- No accuracy improvement. Counter: {cycles_no_improve}/{arg.patience_cycles}. ---")
+
+                    if cycles_no_improve >= arg.patience_cycles:
+                        print(f"Validation accuracy has not improved for {arg.patience_cycles} cycles. Triggering early stopping.")
+                        break
+            
+            # 3. 基于训练/验证集差距的早停
+            if epoch > arg.warmup_epochs and (train_acc - val_acc > arg.overfit_gap_threshold):
+                print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
+                break
+
+    if arg.distributed:
         dist.barrier()
 
-    if arg.rank == 0 and fold_results:
-        mean_acc = np.mean(fold_results)
-        std_acc = np.std(fold_results)
-        print(f"\n{arg.folds}-折交叉验证完成，平均测试 OA: {mean_acc:.2f}% (± {std_acc:.2f})")
+    # --- 测试 ---
+    if arg.rank == 0:
+        print(f"\n--- 训练结束, 使用 Epoch {best_epoch} 的最佳模型测试 ---")
+        if os.path.exists(best_ckpt_path):
+            test_model = HiViT_base(classes=arg.classes).to(device)
+            # 加载时要考虑 checkpoint 的格式
+            checkpoint = torch.load(best_ckpt_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                test_model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                test_model.load_state_dict(checkpoint)
+
+            test_loader_single = DataLoader(test_set, batch_size=arg.batch_size, shuffle=False, num_workers=arg.workers)
+            test_acc = model_test(test_model, test_loader_single)
+            print(f"最终测试 OA: {test_acc:.2f}%")
+        else:
+            print("未找到最佳模型文件，跳过测试。")
+    
+    if arg.rank == 0:
         writer.close()
 
     cleanup()

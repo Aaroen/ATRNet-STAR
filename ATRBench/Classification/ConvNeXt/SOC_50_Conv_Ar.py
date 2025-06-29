@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import sys
 import torch
 import numpy as np
@@ -17,6 +16,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.optim.adamw import AdamW
+from torch.cuda.amp import GradScaler, autocast
 
 # 脚本根目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +86,7 @@ def parameter_setting():
 
     # --- DDP 相关参数 ---
     parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
+    parser.add_argument('--resume', default='', type=str, help='要恢复训练的检查点路径')
     
     args = parser.parse_args()
     return args
@@ -125,7 +126,7 @@ def train_one_epoch(model, data_loader, optimizer, criterion, device, epoch, sca
         inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad()
         
-        with torch.amp.autocast(device_type='cuda'):
+        with autocast():
             outputs = model(inputs)
             loss = criterion(outputs, labels)
 
@@ -156,7 +157,7 @@ def evaluate(model, data_loader, device, args):
 
     for inputs, labels in data_loader:
         inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-        with torch.amp.autocast(device_type='cuda'):
+        with autocast():
             outputs = model(inputs)
         correct_meter += (outputs.argmax(1) == labels).sum()
     
@@ -173,7 +174,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/ConvNeXt_Up')
+        writer = SummaryWriter('runs/ConvNeXt_Up_Adam')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -213,19 +214,42 @@ if __name__ == '__main__':
     
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.warmup_epochs, T_mult=2, eta_min=arg.min_lr)
-    scaler = torch.amp.GradScaler()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=10)
+    scaler = GradScaler()
 
     dataset_name = os.path.basename(os.path.normpath(arg.data_path))
     best_ckpt_path = os.path.join('./results/', f'{dataset_name}_ConvNeXt_best.pth')
     
+    start_epoch = 1
     best_val_acc, best_epoch, epochs_no_improve = 0, 0, 0
 
+    if arg.resume and os.path.exists(arg.resume):
+        print(f"=> 正在加载检查点: '{arg.resume}'")
+        checkpoint = torch.load(arg.resume, map_location=device)
+        
+        model_to_load = model.module if arg.distributed else model
+        
+        # 检查是否为包含状态字典的新格式
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model_to_load.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_acc = checkpoint['best_val_acc']
+            best_epoch = checkpoint['epoch']
+            epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+            print(f"=> 已加载检查点 '{arg.resume}' (从 epoch {start_epoch} 开始)")
+        else:
+            # 兼容只含模型权重的旧格式
+            model_to_load.load_state_dict(checkpoint)
+            print(f"=> 已从旧格式检查点 '{arg.resume}' 加载模型权重。优化器和调度器将重新开始。")
+
     # 训练循环
-    for epoch in range(1, arg.epochs + 1):
+    for epoch in range(start_epoch, arg.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
         val_acc = evaluate(model, val_loader, device, arg)
-        scheduler.step()
+        scheduler.step(val_acc)
 
         if arg.rank == 0:
             print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
@@ -241,7 +265,18 @@ if __name__ == '__main__':
                 best_epoch = epoch
                 epochs_no_improve = 0
                 model_to_save = model.module if arg.distributed else model
-                torch.save(model_to_save.state_dict(), best_ckpt_path)
+                
+                # 保存包含所有状态的字典
+                save_dict = {
+                    'epoch': epoch,
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'best_val_acc': best_val_acc,
+                    'epochs_no_improve': epochs_no_improve
+                }
+                torch.save(save_dict, best_ckpt_path)
                 print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
             else:
                 epochs_no_improve += 1
