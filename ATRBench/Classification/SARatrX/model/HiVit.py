@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, Mlp, to_2tuple, trunc_normal_
+from timm.layers.drop import DropPath
+from timm.layers.mlp import Mlp
+from timm.layers.helpers import to_2tuple
+from timm.layers.weight_init import trunc_normal_
 
 from functools import partial
 
@@ -24,7 +27,7 @@ class Attention(nn.Module):
         if rpe:
             coords_h = torch.arange(input_size)
             coords_w = torch.arange(input_size)
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
             coords_flatten = torch.flatten(coords, 1)
             relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
             relative_coords = relative_coords.permute(1, 2, 0).contiguous()
@@ -306,7 +309,8 @@ class HiViT(nn.Module):
 def hivit_base(**kwargs):
     model = HiViT(
         embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., mlp_ratio=4.,
-        rpe=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs)
     return model
 
 def interpolate_pos_embed(model, checkpoint_model):
@@ -332,78 +336,9 @@ def interpolate_pos_embed(model, checkpoint_model):
             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
             checkpoint_model['absolute_pos_embed'] = new_pos_embed
 
-def HiViT_base(classes):
-    model = HiViT(
-        img_size=224, embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., in_chans=3, mlp_ratio=4.,
-        num_classes=classes,
-        ape=True, rpe=False, norm_layer=partial(nn.LayerNorm, eps=1e-6))
-
-    checkpoint = torch.load(
-        './checkpoint-800.pth',
-        map_location='cpu')
-    checkpoint = checkpoint['model']
-
-    checkpoint_model = {k.replace('module.', ''): v for k, v in checkpoint.items()}
-    state_dict = model.state_dict()
-    for k in ['head.weight', 'head.bias']:
-        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-            print(f"Removing key {k} from pretrained checkpoint")
-            del checkpoint_model[k]
-    # load pre-trained model
-    # print('load pre-trained model')
-    interpolate_pos_embed(model, checkpoint_model)
-    # load pre-trained model
-    msg = model.load_state_dict(checkpoint_model, strict=False)
-    # assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-    # print(msg)
-
-    # manually initialize fc layer: following MoCo v3
-    from timm.models.layers import trunc_normal_
-
-    trunc_normal_(model.head.weight, std=0.01)
-
-    # for linear prob only
-    # hack: revise model's head with BN
-    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6),
-                                     model.head)
-    # freeze all but the head
-    for name, p in model.named_parameters():
-        p.requires_grad = False
-        if 'blocks.14' in name:
-            p.requires_grad_(True)
-        if 'blocks.15' in name:
-            p.requires_grad_(True)
-        if 'blocks.16' in name:
-            p.requires_grad_(True)
-        if 'blocks.17' in name:
-            p.requires_grad_(True)
-        if 'blocks.18' in name:
-            p.requires_grad_(True)
-        if 'blocks.19' in name:
-            p.requires_grad_(True)
-        if 'blocks.20' in name:
-            p.requires_grad_(True)
-        if 'blocks.21' in name:
-            p.requires_grad_(True)
-        if 'blocks.22' in name:
-            p.requires_grad_(True)
-        if 'blocks.23' in name:
-            p.requires_grad_(True)
-        if 'blocks.24' in name:
-            p.requires_grad_(True)
-        if 'blocks.25' in name:
-            p.requires_grad_(True)
-        if 'blocks.26' in name:
-            p.requires_grad_(True)
-        if 'blocks.27' in name:
-            p.requires_grad_(True)
-        if 'blocks.28' in name:
-            p.requires_grad_(True)
-        if 'blocks.29' in name:
-            p.requires_grad_(True)
-    for _, p in model.fc_norm.named_parameters():
-        p.requires_grad = True
-    for _, p in model.head.named_parameters():
-        p.requires_grad = True
-
+def HiViT_base(num_classes, **kwargs):
+    model = hivit_base(
+        num_classes=num_classes,
+        **kwargs
+    )
     return model
