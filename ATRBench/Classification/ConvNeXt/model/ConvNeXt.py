@@ -221,7 +221,7 @@ class convnext_1(torch.nn.Module):
     def __init__(self, num_classes=3):
         super(convnext_1, self).__init__()
 
-        model = models.convnext_base(pretrained=True)
+        model = models.convnext_base(weights='IMAGENET1K_V1')
         # print(model)
         model.classifier[2] = nn.Linear(1024, num_classes)
         self.model = model

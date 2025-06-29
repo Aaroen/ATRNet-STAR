@@ -1,225 +1,331 @@
+# -*- coding: utf-8 -*-
 import sys
 import torch
 import numpy as np
-import re
-from tqdm import tqdm
 import argparse
 import torch.nn as nn
-import collections
-from functools import partial
 import torchvision.transforms as transforms
 from utils.DataLoad import load_data
-from utils.TrainTest import model_val, model_test, model_train
-from model.HiVit import HiViT, HiViT_base
+from utils.TrainTest import model_test
+from model.HiVit import HiViT_base
 import os
-import gc
+from torch.utils.tensorboard.writer import SummaryWriter
+from torch.utils.data import Subset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+import itertools
+from tqdm.auto import tqdm
+import torch.hub
+from torch.optim.adamw import AdamW
+from torch.cuda import amp
 
+def init_distributed_mode(args):
+    """初始化 DDP 环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+    else:
+        print('不使用分布式训练')
+        args.distributed = False
+        args.rank = 0
+        args.gpu = 0
+        return
 
-# True: 只加载模型并测试
-# False: 正常训练模型
-TEST_ONLY = False
+    args.distributed = True
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print(f'| DDP 初始化 (Rank {args.rank}): {args.dist_url}', flush=True)
+    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    dist.barrier()
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def cleanup():
+    """清理 DDP 环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def reduce_value(value, average=True):
+    """在所有 DDP 进程中同步和平均一个值"""
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size < 2:
+        return value
+    with torch.no_grad():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        if average:
+            value /= world_size
+        return value
+
+#参数设置
 
 def parameter_setting():
-    # argparse settings
-    parser = argparse.ArgumentParser(description='Origin Input')
-    default_data_path = os.path.realpath(os.path.join(SCRIPT_DIR, '..', '..', '..', '..', '..', 'datasets', 'SOC_50classes/'))
-    parser.add_argument('--data_path', type=str, default=default_data_path,
-                        help='where data is stored')
-    parser.add_argument('--GPU_ids', type=str, default='0,1',
-                        help='GPU ids, comma-separated (e.g., 0,1)')
-    parser.add_argument('--epochs', type=int, default=30,
-                        help='number of epochs to train')
-    parser.add_argument('--classes', type=int, default=50,
-                        help='number of classes')
-    parser.add_argument('--batch_size', type=int, default=168,
-                        help='input batch size for training')
-    parser.add_argument('--workers', type=int, default=4,
-                        help='number of data loading workers')
-    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
-                        help='learning rate')
-    parser.add_argument('--fold', type=int, default=3,
-                        help='K-fold')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='random seed (default: 1)')
-    parser.add_argument('--img_size', type=int, default=224,
-                        help='input image size')
+    """参数设置函数"""
+    parser = argparse.ArgumentParser(description='最终优化版 HiViT 训练脚本')
+    
+    # --- 基本参数 ---
+    parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
+    parser.add_argument('--epochs', type=int, default=200, help='训练总轮数')
+    parser.add_argument('--classes', type=int, default=50, help='类别数量')
+    parser.add_argument('--batch_size', type=int, default=188, help='单个GPU的批处理大小')
+    parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--img_size', type=int, default=224, help='输入图像尺寸')
+    parser.add_argument('--folds', type=int, default=1, help='交叉验证折数')
+    
+    # --- 学习率与优化器参数 ---
+    parser.add_argument('--lr', type=float, default=5e-4, help='学习率')
+    parser.add_argument('--warmup_epochs', type=int, default=20, help='预热轮数')
+    parser.add_argument('--min_lr', type=float, default=1e-6, help='最低学习率')
+    parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减')
+    
+    # --- 正则化与早停参数 ---
+    parser.add_argument('--head_drop_rate', type=float, default=0.5, help='分类头 Dropout 比率')
+    parser.add_argument('--drop_path_rate', type=float, default=0.2, help='Stochastic Depth / DropPath 比率')
+    parser.add_argument('--patience', type=int, default=50, help='早停: 验证集性能无提升的等待轮数')
+    parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
+    # --- 训练稳定性参数 ---
+    parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
+
+    # --- 预训练与数据增强参数 ---
+    parser.add_argument('--pretrained_weights_url', type=str,
+                        default='',
+                        help='预训练权重（留空则使用本地文件）')
+    
+    # --- DDP 相关参数 ---
+    parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
+    
     args = parser.parse_args()
     return args
 
-def interpolate_pos_embed(model, checkpoint_model):
-    if 'pos_embed' in checkpoint_model:
-        pos_embed_checkpoint = checkpoint_model['pos_embed']
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        num_patches = model.patch_embed.num_patches
-        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-        new_size = int(num_patches ** 0.5)
-        if orig_size != new_size:
-            print(f"Position interpolate from {orig_size}x{orig_size} to {new_size}x{new_size}")
-            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-            pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-            checkpoint_model['pos_embed'] = new_pos_embed
+def get_data_transforms(img_size=224):
+    """获取包含强力数据增强的变换"""
+    # 验证和测试集只做最基础的变换
+    val_transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # 训练集使用激进的自动数据增强策略
+    train_transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.TrivialAugmentWide(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),  # 随机擦除
+    ])
+    return train_transform, val_transform
 
-def train_parallel(model, data_loader, optimizer, scheduler=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#核心训练与评估逻辑
+
+def load_pretrained_weights(model, url, num_classes):
+    """加载预训练权重，并智能处理分类头不匹配的问题"""
+    try:
+        print(f"正在从 {url} 加载预训练权重...")
+        checkpoint = torch.hub.load_state_dict_from_url(url, map_location='cpu', check_hash=True)
+        
+        # 官方权重文件可能包含 'model' 键
+        if 'model' in checkpoint:
+            checkpoint = checkpoint['model']
+
+        # 移除与分类相关的键
+        state_dict = {k: v for k, v in checkpoint.items() if 'head' not in k}
+        
+        # 加载权重
+        msg = model.load_state_dict(state_dict, strict=False)
+        print("预训练权重加载完毕。忽略的键:", msg.missing_keys)
+        
+    except Exception as e:
+        print(f"加载预训练权重失败: {e}。将从零开始训练。")
+
+
+def train_one_epoch(model, data_loader, optimizer, criterion, device, epoch, scaler, args):
+    """单轮训练循环，包含 DDP 同步和 AMP"""
     model.train()
-    criterion = nn.CrossEntropyLoss()
-    correct = 0
-    total_loss = 0
-    total = 0
+    sampler = data_loader.sampler
+    if args.distributed:
+        sampler.set_epoch(epoch)
+
+    # 准备记录每个进程的指标
+    loss_meter = torch.tensor(0.0, device=device)
+    correct_meter = torch.tensor(0.0, device=device)
     
-    progress_bar = tqdm(data_loader, desc="Training", ncols=100, leave=True)
-    
-    for i, (inputs, labels) in enumerate(progress_bar):
-        inputs, labels = inputs.to(device), labels.to(device)
-        batch_size = labels.size(0)
-        total += batch_size
-        
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        
+    progress_bar = tqdm(data_loader, desc=f"Epoch {epoch}/{args.epochs}", disable=(args.rank != 0), dynamic_ncols=True)
+
+    for inputs, labels in progress_bar:
+        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
         
-        pred = outputs.max(1, keepdim=True)[1]
-        correct += pred.eq(labels.view_as(pred)).sum().item()
-        total_loss += loss.item()
-        
-        current_acc = 100. * correct / total
-        progress_bar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{current_acc:.2f}%")
+        with amp.autocast():
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
-    if scheduler is not None:
-        scheduler.step()
-    
-    avg_loss = total_loss / len(data_loader)
-    accuracy = 100. * correct / total
-    print(f"Train Accuracy: {accuracy:.2f}%, Average Loss: {avg_loss:.4f}")
-    return avg_loss
+        scaler.scale(loss).backward()
+        if args.clip_grad > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        scaler.step(optimizer)
+        scaler.update()
 
-def test_and_report(model, test_loader, best_epoch, best_test_accuracy, history):
-    acc = model_test(model, test_loader)
-    print(f'Final Test Accuracy is {acc}')
-    
-    if not history['accuracy']:
-        history['accuracy'].append(acc)
+        # 记录当前批次的指标
+        loss_meter += loss.detach()
+        correct_meter += (outputs.argmax(1) == labels).sum()
 
-    print(f'The best epoch during training was {best_epoch}, with val accuracy: {best_test_accuracy:.2f}%.')
-    print(f'Final test accuracy on the loaded model is: {acc:.2f}%.')
+    # DDP - 同步所有GPU的指标
+    total_loss = reduce_value(loss_meter, average=False)
+    total_correct = reduce_value(correct_meter, average=False)
     
-    print(f"Overall Accuracy (OA) is {np.mean(history['accuracy'])}, STD is {np.std(history['accuracy'])}")
-    print("All accuracy records: ", history['accuracy'])
+    avg_loss = total_loss.item() / len(sampler.dataset)
+    accuracy = 100. * total_correct.item() / len(sampler.dataset)
+    return avg_loss, accuracy
+
+@torch.no_grad()
+def evaluate(model, data_loader, criterion, device, args):
+    """评估函数，用于验证集和测试集"""
+    model.eval()
+    correct_meter = torch.tensor(0.0, device=device)
+
+    for inputs, labels in data_loader:
+        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        with amp.autocast():
+            outputs = model(inputs)
+        correct_meter += (outputs.argmax(1) == labels).sum()
+    
+    # DDP - 同步结果
+    total_correct = reduce_value(correct_meter, average=False)
+    
+    total_samples = len(data_loader.sampler.dataset) if args.distributed else len(data_loader.dataset)
+    accuracy = 100. * total_correct.item() / total_samples
+    return accuracy
+
+#主函数
 
 if __name__ == '__main__':
-    os.makedirs('./Model/', exist_ok=True)
-    os.makedirs('./results/', exist_ok=True)
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
-    
     arg = parameter_setting()
-    gpu_ids = [int(id) for id in arg.GPU_ids.split(',')]
-    device = torch.device(f"cuda:{gpu_ids[0]}" if torch.cuda.is_available() else "cpu")
+    init_distributed_mode(arg)
     
-    torch.backends.cudnn.benchmark = True
+    if arg.rank == 0:
+        os.makedirs('./results/', exist_ok=True)
+        writer = SummaryWriter('runs/HiViT_Final_Optimized')
+
+    torch.manual_seed(arg.seed)
+    np.random.seed(arg.seed)
+    device = torch.device(f"cuda:{arg.gpu}")
+
+    train_transform, val_transform = get_data_transforms(arg.img_size)
     
-    history = collections.defaultdict(list)
+    # 在主进程中准备数据集信息，然后广播
+    full_train_dataset = load_data(os.path.join(arg.data_path, 'train'), train_transform)
+    val_dataset_for_val_transform = load_data(os.path.join(arg.data_path, 'train'), val_transform)
+    test_set = load_data(os.path.join(arg.data_path, 'test'), val_transform)
 
-    data_transform = transforms.Compose([
-        transforms.Resize(arg.img_size),
-        transforms.ToTensor(),
-    ])
+    dataset_size = len(full_train_dataset)
+    indices = list(range(dataset_size))
+    np.random.shuffle(indices)
+    folds_indices = np.array_split(indices, arg.folds)
+    fold_results = []
 
-    try:
-        model = HiViT_base(arg.classes)
-        print("成功创建HiViT_base模型")
-    except Exception as e:
-        print(f"创建HiViT_base模型失败: {e}")
-        model = HiViT(img_size=arg.img_size, num_classes=arg.classes)
-        print("使用默认配置创建HiViT模型")
+    for fold_idx in range(arg.folds):
+        if arg.rank == 0:
+            print(f"\n===== Fold {fold_idx + 1}/{arg.folds} =====")
 
-    if torch.cuda.is_available() and len(gpu_ids) > 1:
-        model = nn.DataParallel(model, device_ids=gpu_ids)
-    model.to(device)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=arg.lr, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=arg.epochs)
-    best_test_accuracy = 0
-    best_epoch = 0
-    dataset_name = os.path.basename(os.path.normpath(arg.data_path))
-    save_path = os.path.join('./Model/', f'{dataset_name}_HiViT.pth')
-
-    if not TEST_ONLY:
-        print("--- Starting Training ---\n")
-        train_all = load_data(os.path.join(arg.data_path, 'train'), data_transform)
-        test_set = load_data(os.path.join(arg.data_path, 'test'), data_transform)
-        
-        for k_F in tqdm(range(arg.fold), desc="Folds"):
-            train_loader = torch.utils.data.DataLoader(
-                train_all, batch_size=arg.batch_size, shuffle=True, 
-                num_workers=arg.workers)
-            test_loader = torch.utils.data.DataLoader(
-                test_set, batch_size=arg.batch_size, shuffle=False, 
-                num_workers=arg.workers)
-            
-            best_test_accuracy_fold = 0
-            best_epoch_fold = 0
-
-            for epoch in range(1, arg.epochs + 1):
-                print(f"\n--- Fold {k_F + 1}, Epoch {epoch} ---\n")
-                
-                model_train(model, train_loader, opt, scheduler)
-                
-                accuracy = model_val(model, test_loader)
-                print(f"--- Val Accuracy: {accuracy:.2f}% ---")
-
-                if accuracy >= best_test_accuracy_fold:
-                    best_epoch_fold = epoch
-                    best_test_accuracy_fold = accuracy
-                    state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-                    torch.save(state_to_save, save_path)
-                    print(f"*** New best model saved at epoch {best_epoch_fold} with accuracy {best_test_accuracy_fold:.2f}% ***")
-            
-            best_test_accuracy = best_test_accuracy_fold
-            best_epoch = best_epoch_fold
-            
-            print(f"\nLoading best model from fold {k_F+1} (epoch {best_epoch}) for testing...")
-            if os.path.exists(save_path):
-                state_dict = torch.load(save_path)
-                if isinstance(model, nn.DataParallel):
-                    model.module.load_state_dict(state_dict)
-                else:
-                    model.load_state_dict(state_dict)
-            acc = model_test(model, test_loader)
-            history['accuracy'].append(acc)
-
-    if TEST_ONLY:
-        print("\n--- Testing Phase ---")
-        if os.path.exists(save_path):
-            state_dict = torch.load(save_path)
-            if isinstance(model, nn.DataParallel):
-                model.module.load_state_dict(state_dict)
-            else:
-                model.load_state_dict(state_dict)
-            print("Model loaded successfully.")
-            
-            test_set = load_data(os.path.join(arg.data_path, 'test'), data_transform)
-            test_loader = torch.utils.data.DataLoader(
-                test_set, batch_size=arg.batch_size, shuffle=False,
-                num_workers=arg.workers)
-            test_and_report(model, test_loader, 0, 0, history)
+        # K-Fold 数据划分
+        if arg.folds <= 1:
+            split_idx = int(0.8 * dataset_size)
+            train_indices, val_indices = indices[:split_idx], indices[split_idx:]
         else:
-            print("Error: Model file not found. Cannot run test.")
+            val_indices = folds_indices[fold_idx].tolist()
+            train_indices = list(itertools.chain.from_iterable([folds_indices[i] for i in range(arg.folds) if i != fold_idx]))
 
-    if history['accuracy']:
-        np.save(f'./results/{dataset_name}_result.npy', np.array(history['accuracy']))
-    
-    print(f"Best model checkpoint is saved at: {save_path}")
+        train_set = Subset(full_train_dataset, train_indices)
+        val_set = Subset(val_dataset_for_val_transform, val_indices)
+
+        train_sampler = DistributedSampler(train_set)
+        val_sampler = DistributedSampler(val_set, shuffle=False)
+
+        train_loader = DataLoader(train_set, batch_size=arg.batch_size, sampler=train_sampler, num_workers=arg.workers, pin_memory=True)
+        val_loader = DataLoader(val_set, batch_size=arg.batch_size, sampler=val_sampler, num_workers=arg.workers, pin_memory=True)
+
+        # 创建模型（HiViT_base 只接受 classes 一个参数）
+        model = HiViT_base(classes=arg.classes).to(device)
+        
+        #加载预训练权重
+        if arg.pretrained_weights_url:
+            load_pretrained_weights(model, arg.pretrained_weights_url, arg.classes)
+        
+        # DDP 包装
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[arg.gpu])
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.warmup_epochs, T_mult=2, eta_min=arg.min_lr)
+        scaler = amp.GradScaler()
+
+        dataset_name = os.path.basename(os.path.normpath(arg.data_path))
+        best_ckpt_path = os.path.join('./results/', f'{dataset_name}_HiViT_fold{fold_idx+1}_best.pth')
+        
+        best_val_acc, best_epoch, epochs_no_improve = 0, 0, 0
+
+        for epoch in range(1, arg.epochs + 1):
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
+            val_acc = evaluate(model, val_loader, criterion, device, arg)
+            scheduler.step()
+
+            if arg.rank == 0:
+                print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                
+                # 根据是否启用交叉验证，决定 TensorBoard tag 的名称
+                train_acc_tag = f'Accuracy/train_fold{fold_idx+1}' if arg.folds > 1 else 'Accuracy/train'
+                val_acc_tag = f'Accuracy/val_fold{fold_idx+1}' if arg.folds > 1 else 'Accuracy/validation'
+                loss_tag = f'Loss/train_fold{fold_idx+1}' if arg.folds > 1 else 'Loss/train'
+                lr_tag = f'Learning_Rate/fold{fold_idx+1}' if arg.folds > 1 else 'Learning_Rate'
+
+                writer.add_scalar(train_acc_tag, train_acc, epoch)
+                writer.add_scalar(val_acc_tag, val_acc, epoch)
+                writer.add_scalar(loss_tag, train_loss, epoch)
+                writer.add_scalar(lr_tag, optimizer.param_groups[0]['lr'], epoch)
+
+                # --- 检查早停条件 ---
+                # 1. 基于验证集性能
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch = epoch
+                    epochs_no_improve = 0
+                    torch.save(model.module.state_dict(), best_ckpt_path)
+                    print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
+                else:
+                    epochs_no_improve += 1
+
+                if epochs_no_improve >= arg.patience:
+                    print(f"连续 {arg.patience} 轮验证集性能未提升，触发早停。")
+                    break
+                
+                # 2.基于训练/验证集差距
+                if epoch > arg.warmup_epochs and (train_acc - val_acc > arg.overfit_gap_threshold):
+                    print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
+                    break
+
+        dist.barrier()
+
+        # --- 测试 ---
+        if arg.rank == 0:
+            print(f"\n--- Fold {fold_idx + 1} 结束, 使用 Epoch {best_epoch} 的最佳模型测试 ---")
+            if os.path.exists(best_ckpt_path):
+                test_model = HiViT_base(classes=arg.classes).to(device)
+                test_model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+                test_loader_single = DataLoader(test_set, batch_size=arg.batch_size, shuffle=False, num_workers=arg.workers)
+                test_acc = model_test(test_model, test_loader_single)
+                print(f"[Fold {fold_idx+1}] 最终测试 OA: {test_acc:.2f}%")
+                fold_results.append(test_acc)
+            else:
+                print("[Fold] 未找到最佳模型文件，跳过测试。")
+        dist.barrier()
+
+    if arg.rank == 0 and fold_results:
+        mean_acc = np.mean(fold_results)
+        std_acc = np.std(fold_results)
+        print(f"\n{arg.folds}-折交叉验证完成，平均测试 OA: {mean_acc:.2f}% (± {std_acc:.2f})")
+        writer.close()
+
+    cleanup()

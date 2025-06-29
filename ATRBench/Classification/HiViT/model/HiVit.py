@@ -317,11 +317,9 @@ def HiViT_base(classes):
         num_classes=classes,
         ape=True, rpe=False, norm_layer=partial(nn.LayerNorm, eps=1e-6))
 
-    # 尝试多个可能的预训练模型路径
     pretrained_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mae_hivit_base_1600ep.pth'),  # 相对路径
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pretrained', 'mae_hivit_base_1600ep.pth'),  # 另一个可能的相对路径
-        'D:\\Data\\无人集群感知数据库_数据集分割\\HiViT\\model\\mae_hivit_base_1600ep.pth',  # 原始Windows路径
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     'pretrained', 'mae_hivit_base_1600ep.pth'),
     ]
     
     checkpoint = None
@@ -329,7 +327,7 @@ def HiViT_base(classes):
         if os.path.exists(path):
             print(f"找到预训练模型: {path}")
             try:
-                checkpoint = torch.load(path, map_location='cpu')
+                checkpoint = torch.load(path, map_location='cpu', weights_only=True)
                 break
             except Exception as e:
                 print(f"加载模型 {path} 失败: {e}")

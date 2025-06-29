@@ -6,6 +6,7 @@ import re
 from tqdm import tqdm
 import argparse
 import torch.nn as nn
+import os
 
 import collections
 from functools import partial
@@ -14,11 +15,14 @@ from utils.DataLoad import load_data
 from utils.TrainTest import model_train, model_val, model_test
 from model.HiVit import HiViT, HiViT_base
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def parameter_setting():
     # argparse settings
     parser = argparse.ArgumentParser(description='Origin Input')
-    parser.add_argument('--data_path', type=str, default="../地距/SOC_50classes/",
-                        help='where data is stored')
+    default_data_path = os.path.realpath(os.path.join(SCRIPT_DIR, '..', '..', '..', '..', '..', 'datasets', 'SOC_50classes/'))
+    parser.add_argument('--data_path', type=str, default=default_data_path,
+                        help='path to dataset')
     parser.add_argument('--GPU_ids', type=int, default=0,
                         help='GPU ids')
     parser.add_argument('--epochs', type=int, default=30,
