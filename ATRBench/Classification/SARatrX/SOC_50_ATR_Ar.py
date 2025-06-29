@@ -59,7 +59,7 @@ def reduce_value(value, average=True):
 
 def parameter_setting():
     """参数设置函数"""
-    parser = argparse.ArgumentParser(description='SARatrX (HiViT)_Adam')
+    parser = argparse.ArgumentParser(description='SARatrX (HiViT)_Up')
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
@@ -219,7 +219,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/SARatrX_Exp')
+        writer = SummaryWriter('runs/SARatrX_Exp_Adam')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
