@@ -63,7 +63,7 @@ def parameter_setting():
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
-    parser.add_argument('--epochs', type=int, default=200, help='训练总轮数')
+    parser.add_argument('--epochs', type=int, default=365, help='训练总轮数')
     parser.add_argument('--classes', type=int, default=50, help='类别数量')
     parser.add_argument('--batch_size', type=int, default=128, help='单个GPU的批处理大小')
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
