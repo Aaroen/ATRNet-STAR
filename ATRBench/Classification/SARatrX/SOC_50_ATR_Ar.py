@@ -18,8 +18,6 @@ from torch.optim.adamw import AdamW
 import itertools
 from torch.cuda import amp
 
-# DDP and AMP utility functions from previous scripts
-
 def init_distributed_mode(args):
     """初始化 DDP 环境"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -63,7 +61,7 @@ def parameter_setting():
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
-    parser.add_argument('--epochs', type=int, default=520, help='训练总轮数')
+    parser.add_argument('--epochs', type=int, default=256, help='训练总轮数')
     parser.add_argument('--classes', type=int, default=50, help='类别数量')
     parser.add_argument('--batch_size', type=int, default=128, help='单个GPU的批处理大小')
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
@@ -75,11 +73,9 @@ def parameter_setting():
     parser.add_argument('--warmup_epochs', type=int, default=20, help='预热轮数')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='最低学习率')
     parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减')
-    parser.add_argument('--T_0', type=int, default=15, help='余弦退火调度器的初始周期长度 (epochs)')
-    parser.add_argument('--T_mult', type=int, default=2, help='余弦退火周期增长的乘数')
     
     # --- 正则化与早停参数 ---
-    parser.add_argument('--patience_cycles', type=int, default=1, help='早停: 验证集性能无提升的等待学习率周期数')
+    parser.add_argument('--patience', type=int, default=30, help='早停: 验证集性能无提升的等待轮数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     parser.add_argument('--overfit_check_epoch', type=int, default=20, help='开始检查过拟合的轮数')
     
@@ -214,15 +210,15 @@ def evaluate(model, data_loader, criterion, device, args):
     accuracy = 100. * total_correct.item() / total_samples
     return accuracy
 
-# 主函数
-if __name__ == '__main__':
+def main():
+    """主执行函数"""
     arg = parameter_setting()
     init_distributed_mode(arg)
     
     # 保存的日志名称及模型训练结果路径
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/SARatrX_Exp_CoaW')
+        writer = SummaryWriter('runs/SARatrX_Exp_CosA')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -269,7 +265,7 @@ if __name__ == '__main__':
     
     #  "预热 + 余弦退火" 学习率调度器
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.T_0, T_mult=arg.T_mult, eta_min=arg.min_lr)
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=arg.epochs - arg.warmup_epochs, eta_min=arg.min_lr)
     scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
 
     scaler = amp.GradScaler()
@@ -278,9 +274,7 @@ if __name__ == '__main__':
     best_ckpt_path = os.path.join('./results/', f'{dataset_name}_SARatrX_best.pth')
     
     start_epoch = 1
-    best_val_acc, best_epoch = 0, 0
-    cycles_no_improve = 0
-    best_acc_at_last_cycle_check = 0.0
+    best_val_acc, best_epoch, epochs_no_improve = 0, 0, 0
     
     if arg.resume and os.path.isfile(arg.resume):
         print(f"=> 从 '{arg.resume}' 加载 checkpoint")
@@ -295,8 +289,7 @@ if __name__ == '__main__':
         start_epoch = checkpoint['epoch'] + 1
         best_val_acc = checkpoint.get('best_val_acc', 0.0)
         best_epoch = checkpoint.get('epoch', 0)
-        cycles_no_improve = checkpoint.get('cycles_no_improve', 0)
-        best_acc_at_last_cycle_check = checkpoint.get('best_acc_at_last_cycle_check', 0.0)
+        epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
         print(f"=> 从 epoch {start_epoch} 继续训练")
     
     for epoch in range(start_epoch, arg.epochs + 1):
@@ -317,6 +310,7 @@ if __name__ == '__main__':
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_epoch = epoch
+                epochs_no_improve = 0
                 model_to_save = model.module if arg.distributed else model
                 state_to_save = {
                     'epoch': epoch,
@@ -325,28 +319,17 @@ if __name__ == '__main__':
                     'scheduler_state_dict': scheduler.state_dict(),
                     'scaler_state_dict': scaler.state_dict(),
                     'best_val_acc': best_val_acc,
-                    'cycles_no_improve': cycles_no_improve,
-                    'best_acc_at_last_cycle_check': best_acc_at_last_cycle_check
+                    'epochs_no_improve': epochs_no_improve
                 }
                 torch.save(state_to_save, best_ckpt_path)
                 print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
+            else:
+                epochs_no_improve += 1
 
-            # 2. 基于学习率周期的早停
-            if epoch > arg.warmup_epochs:
-                current_lr = optimizer.param_groups[0]['lr']
-                if abs(current_lr - arg.min_lr) < 1e-8:
-                    print(f"--- Cycle ended at epoch {epoch}. Current best acc: {best_val_acc:.2f}%. Best at last check: {best_acc_at_last_cycle_check:.2f}% ---")
-                    if best_val_acc > best_acc_at_last_cycle_check:
-                        cycles_no_improve = 0
-                        best_acc_at_last_cycle_check = best_val_acc
-                        print("--- Accuracy improved. Resetting early stopping counter. ---")
-                    else:
-                        cycles_no_improve += 1
-                        print(f"--- No accuracy improvement. Counter: {cycles_no_improve}/{arg.patience_cycles}. ---")
-                    
-                    if cycles_no_improve >= arg.patience_cycles:
-                        print(f"Validation accuracy has not improved for {arg.patience_cycles} cycles. Triggering early stopping.")
-                        break
+            # 2. 基于耐心值的早停
+            if epochs_no_improve >= arg.patience:
+                print(f"连续 {arg.patience} 轮验证集性能未提升，触发早停。")
+                break
 
             # 3. 基于过拟合差距的早停
             if epoch > arg.overfit_check_epoch and (train_acc - val_acc > arg.overfit_gap_threshold):
@@ -382,3 +365,6 @@ if __name__ == '__main__':
         writer.close()
 
     cleanup()
+
+if __name__ == '__main__':
+    main()

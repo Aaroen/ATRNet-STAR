@@ -64,7 +64,7 @@ def parameter_setting():
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
-    parser.add_argument('--epochs', type=int, default=200, help='训练总轮数')
+    parser.add_argument('--epochs', type=int, default=256, help='训练总轮数')
     parser.add_argument('--classes', type=int, default=50, help='类别数量')
     parser.add_argument('--batch_size', type=int, default=128, help='单个GPU的批处理大小')
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
@@ -80,6 +80,7 @@ def parameter_setting():
     # --- 正则化与早停参数 ---
     parser.add_argument('--patience', type=int, default=30, help='早停: 验证集性能无提升的等待轮数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
+    parser.add_argument('--overfit_check_epoch', type=int, default=20, help='开始检查过拟合的轮数')
     
     # --- 训练稳定性参数 ---
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
@@ -174,7 +175,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/ConvNeXt_Up_Adam')
+        writer = SummaryWriter('runs/ConvNeXt_Up_CosA')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -214,7 +215,12 @@ if __name__ == '__main__':
     
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=10)
+    
+    # "预热 + 余弦退火" 学习率调度器
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=arg.epochs - arg.warmup_epochs, eta_min=arg.min_lr)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
+
     scaler = GradScaler()
 
     dataset_name = os.path.basename(os.path.normpath(arg.data_path))
@@ -249,7 +255,7 @@ if __name__ == '__main__':
     for epoch in range(start_epoch, arg.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
         val_acc = evaluate(model, val_loader, device, arg)
-        scheduler.step(val_acc)
+        scheduler.step()
 
         if arg.rank == 0:
             print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
@@ -286,7 +292,7 @@ if __name__ == '__main__':
                 break
             
             # 2.基于训练/验证集差距
-            if epoch > arg.warmup_epochs and (train_acc - val_acc > arg.overfit_gap_threshold):
+            if epoch > arg.overfit_check_epoch and (train_acc - val_acc > arg.overfit_gap_threshold):
                 print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
                 break
 
