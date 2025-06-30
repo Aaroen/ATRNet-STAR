@@ -89,6 +89,10 @@ def parameter_setting():
     parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
     parser.add_argument('--resume', default='', type=str, help='要恢复训练的检查点路径')
     
+    # --- 测试模式参数 ---
+    parser.add_argument('--test_only', action='store_true', help='仅运行测试模式')
+    parser.add_argument('--test_checkpoint', type=str, default='', help='用于测试的 checkpoint 路径')
+
     args = parser.parse_args()
     return args
 
@@ -151,21 +155,44 @@ def train_one_epoch(model, data_loader, optimizer, criterion, device, epoch, sca
     return avg_loss, accuracy
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, args):
-    """评估函数，用于验证集和测试集"""
+def evaluate(model, data_loader, device, args, desc=""):
+    """评估函数，用于验证集和测试集，并实时显示精度"""
     model.eval()
     correct_meter = torch.tensor(0.0, device=device)
+    total_samples_meter = torch.tensor(0.0, device=device)
 
-    for inputs, labels in data_loader:
+    # 准备进度条
+    progress_bar = tqdm(data_loader, desc=desc, disable=(args.rank != 0), dynamic_ncols=True)
+    for inputs, labels in progress_bar:
         inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         with autocast():
             outputs = model(inputs)
+        
         correct_meter += (outputs.argmax(1) == labels).sum()
+        total_samples_meter += inputs.size(0)
+
+        # 在 DDP 环境下，同步各个进程的中间结果以计算实时准确率
+        if args.distributed:
+            # 创建张量副本进行 all_reduce 操作，避免修改原始累加值
+            synced_correct = reduce_value(correct_meter.clone(), average=False)
+            synced_total = reduce_value(total_samples_meter.clone(), average=False)
+        else:
+            synced_correct = correct_meter
+            synced_total = total_samples_meter
+        
+        # 只在主进程更新进度条描述
+        if args.rank == 0:
+            current_acc = 100. * synced_correct.item() / synced_total.item() if synced_total.item() > 0 else 0.0
+            progress_bar.set_description(f"{desc} (OA: {current_acc:.2f}%)")
     
-    # DDP - 同步结果
-    total_correct = reduce_value(correct_meter, average=False)
-    
-    total_samples = len(data_loader.sampler.dataset) if args.distributed else len(data_loader.dataset)
+    # 循环结束后，进行最终的同步，计算最终准确率
+    if args.distributed:
+        total_correct = synced_correct
+        total_samples = len(data_loader.sampler.dataset)
+    else:
+        total_correct = correct_meter
+        total_samples = len(data_loader.dataset)
+        
     accuracy = 100. * total_correct.item() / total_samples
     return accuracy
 
@@ -213,105 +240,154 @@ if __name__ == '__main__':
     if arg.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[arg.gpu])
     
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
-    
-    # "预热 + 余弦退火" 学习率调度器
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=arg.epochs - arg.warmup_epochs, eta_min=arg.min_lr)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
+    best_epoch = 0 # 初始化 best_epoch
 
-    scaler = GradScaler()
-
-    dataset_name = os.path.basename(os.path.normpath(arg.data_path))
-    best_ckpt_path = os.path.join('./results/', f'{dataset_name}_ConvNeXt_best.pth')
-    
-    start_epoch = 1
-    best_val_acc, best_epoch, epochs_no_improve = 0, 0, 0
-
-    if arg.resume and os.path.exists(arg.resume):
-        print(f"=> 正在加载检查点: '{arg.resume}'")
-        checkpoint = torch.load(arg.resume, map_location=device)
+    if not arg.test_only:
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
         
-        model_to_load = model.module if arg.distributed else model
+        # "预热 + 余弦退火" 学习率调度器
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=arg.epochs - arg.warmup_epochs, eta_min=arg.min_lr)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
+
+        scaler = GradScaler()
+
+        dataset_name = os.path.basename(os.path.normpath(arg.data_path))
+        best_ckpt_path = os.path.join('./results/', f'{dataset_name}_ConvNeXt_best.pth')
         
-        # 检查是否为包含状态字典的新格式
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model_to_load.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_acc = checkpoint['best_val_acc']
-            best_epoch = checkpoint['epoch']
-            epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
-            print(f"=> 已加载检查点 '{arg.resume}' (从 epoch {start_epoch} 开始)")
-        else:
-            # 兼容只含模型权重的旧格式
-            model_to_load.load_state_dict(checkpoint)
-            print(f"=> 已从旧格式检查点 '{arg.resume}' 加载模型权重。优化器和调度器将重新开始。")
+        start_epoch = 1
+        best_val_acc, epochs_no_improve = 0, 0
 
-    # 训练循环
-    for epoch in range(start_epoch, arg.epochs + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
-        val_acc = evaluate(model, val_loader, device, arg)
-        scheduler.step()
-
-        if arg.rank == 0:
-            print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
-            writer.add_scalar('Accuracy/train', train_acc, epoch)
-            writer.add_scalar('Accuracy/validation', val_acc, epoch)
-            writer.add_scalar('Loss/train', train_loss, epoch)
-            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-
-            # --- 检查早停条件 ---
-            # 1. 基于验证集性能
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_epoch = epoch
-                epochs_no_improve = 0
-                model_to_save = model.module if arg.distributed else model
-                
-                # 保存包含所有状态的字典
-                save_dict = {
-                    'epoch': epoch,
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'best_val_acc': best_val_acc,
-                    'epochs_no_improve': epochs_no_improve
-                }
-                torch.save(save_dict, best_ckpt_path)
-                print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
-            else:
-                epochs_no_improve += 1
-
-            if epochs_no_improve >= arg.patience:
-                print(f"连续 {arg.patience} 轮验证集性能未提升，触发早停。")
-                break
+        if arg.resume and os.path.exists(arg.resume):
+            print(f"=> 正在加载检查点: '{arg.resume}'")
+            checkpoint = torch.load(arg.resume, map_location=device)
             
-            # 2.基于训练/验证集差距
-            if epoch > arg.overfit_check_epoch and (train_acc - val_acc > arg.overfit_gap_threshold):
-                print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
-                break
+            model_to_load = model.module if arg.distributed else model
+            
+            # 检查是否为包含状态字典的新格式
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model_to_load.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_acc = checkpoint['best_val_acc']
+                best_epoch = checkpoint['epoch']
+                epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+                print(f"=> 已加载检查点 '{arg.resume}' (从 epoch {start_epoch} 开始)")
+            else:
+                # 兼容只含模型权重的旧格式
+                model_to_load.load_state_dict(checkpoint)
+                print(f"=> 已从旧格式检查点 '{arg.resume}' 加载模型权重。优化器和调度器将重新开始。")
+
+        # 训练循环
+        for epoch in range(start_epoch, arg.epochs + 1):
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler, arg)
+            val_acc = evaluate(model, val_loader, device, arg, desc=f"Epoch {epoch} Val")
+            scheduler.step()
+
+            if arg.rank == 0:
+                print(f"[Epoch {epoch}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                writer.add_scalar('Accuracy/train', train_acc, epoch)
+                writer.add_scalar('Accuracy/validation', val_acc, epoch)
+                writer.add_scalar('Loss/train', train_loss, epoch)
+                writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+
+                # --- 检查早停条件 ---
+                # 1. 基于验证集性能
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch = epoch
+                    epochs_no_improve = 0
+                    model_to_save = model.module if arg.distributed else model
+                    
+                    # 保存包含所有状态的字典
+                    save_dict = {
+                        'epoch': epoch,
+                        'model_state_dict': model_to_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'best_val_acc': best_val_acc,
+                        'epochs_no_improve': epochs_no_improve
+                    }
+                    torch.save(save_dict, best_ckpt_path)
+                    print(f"*** 新最佳模型保存在 Epoch {best_epoch} (Val Acc: {best_val_acc:.2f}%) ***")
+                else:
+                    epochs_no_improve += 1
+
+                if epochs_no_improve >= arg.patience:
+                    print(f"连续 {arg.patience} 轮验证集性能未提升，触发早停。")
+                    break
+                
+                # 2.基于训练/验证集差距
+                if epoch > arg.overfit_check_epoch and (train_acc - val_acc > arg.overfit_gap_threshold):
+                    print(f"训练/验证准确率差距 ({train_acc - val_acc:.2f}%) 超过阈值 {arg.overfit_gap_threshold}，触发早停。")
+                    break
 
     if arg.distributed:
         dist.barrier()
 
-    # 最终测试
-    if arg.rank == 0:
-        print(f"\n--- 训练结束, 使用 Epoch {best_epoch} 的最佳模型测试 ---")
-        if os.path.exists(best_ckpt_path):
-            test_model = convnext_1(num_classes=arg.classes).to(device)
-            test_model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
-            test_loader_single = DataLoader(test_set, batch_size=arg.batch_size, shuffle=False, num_workers=arg.workers)
-            test_acc = model_test(test_model, test_loader_single)
-            print(f"最终测试 OA: {test_acc:.2f}%")
-        else:
-            print("未找到最佳模型文件，跳过测试。")
+    # --- 最终测试 ---
+    # 在所有进程上确定要测试的 checkpoint 路径
+    if arg.test_only:
+        ckpt_path = arg.test_checkpoint
+        if not ckpt_path:
+            if arg.rank == 0:
+                print("错误：仅测试模式需要通过 --test_checkpoint 指定模型路径。")
+            if arg.distributed:
+                dist.barrier()
+            cleanup()
+            sys.exit(1)
+        if arg.rank == 0:
+            print(f"\n--- 仅测试模式, 使用模型: {ckpt_path} ---")
+    else:
+        dataset_name = os.path.basename(os.path.normpath(arg.data_path))
+        ckpt_path = os.path.join('./results/', f'{dataset_name}_ConvNeXt_best.pth')
+        if arg.rank == 0:
+            print(f"\n--- 训练结束, 使用 Epoch {best_epoch} 的最佳模型测试 ---")
 
-    if arg.rank == 0:
+    # 所有进程都参与测试
+    if os.path.exists(ckpt_path):
+        if arg.rank == 0:
+            print(f"正在从 '{ckpt_path}' 加载最佳模型进行测试...")
+
+        # 1. 加载权重到CPU, 使用 weights_only=True 避免安全风险
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+
+        # 2. 创建模型并移动到各进程对应的 GPU
+        test_model = convnext_1(num_classes=arg.classes).to(device)
+
+        # 3. 如果是DDP，先用 DDP 包裹模型
+        if arg.distributed:
+            test_model = torch.nn.parallel.DistributedDataParallel(test_model, device_ids=[arg.gpu])
+
+        # 4. 将权重加载到模型中
+        model_to_load = test_model.module if arg.distributed else test_model
+        if 'model_state_dict' in checkpoint:
+            model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            model_to_load.load_state_dict(checkpoint, strict=False)
+
+        # 5. 创建测试数据加载器
+        test_sampler = DistributedSampler(test_set, shuffle=False) if arg.distributed else None
+        test_loader = DataLoader(test_set, batch_size=arg.batch_size, sampler=test_sampler, num_workers=arg.workers, pin_memory=True, shuffle=False)
+
+        # 6. 执行评估
+        test_acc = evaluate(test_model, test_loader, device, arg, desc="Testing")
+
+        # 7. 只在 rank 0 打印结果
+        if arg.rank == 0:
+            print(f"最终测试 OA: {test_acc:.2f}%")
+    else:
+        if arg.rank == 0:
+            print(f"未找到最佳模型文件 '{ckpt_path}'，跳过测试。")
+
+    if arg.distributed:
+        dist.barrier()
+
+    if arg.rank == 0 and not arg.test_only:
         writer.close()
 
     cleanup()
