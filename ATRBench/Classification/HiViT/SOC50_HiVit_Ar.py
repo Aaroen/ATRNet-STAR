@@ -81,7 +81,7 @@ def parameter_setting():
     # --- 正则化与早停参数 ---
     parser.add_argument('--head_drop_rate', type=float, default=0.5, help='分类头 Dropout 比率')
     parser.add_argument('--drop_path_rate', type=float, default=0.2, help='Stochastic Depth / DropPath 比率')
-    parser.add_argument('--patience_cycles', type=int, default=2, help='早停: 验证集性能无提升的等待学习率周期数')
+    parser.add_argument('--patience_cycles', type=int, default=1, help='早停: 验证集性能无提升的等待学习率周期数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     # --- 训练稳定性参数 ---
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')

@@ -63,7 +63,7 @@ def parameter_setting():
     
     # --- 基本参数 ---
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
-    parser.add_argument('--epochs', type=int, default=365, help='训练总轮数')
+    parser.add_argument('--epochs', type=int, default=520, help='训练总轮数')
     parser.add_argument('--classes', type=int, default=50, help='类别数量')
     parser.add_argument('--batch_size', type=int, default=128, help='单个GPU的批处理大小')
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
@@ -79,7 +79,7 @@ def parameter_setting():
     parser.add_argument('--T_mult', type=int, default=2, help='余弦退火周期增长的乘数')
     
     # --- 正则化与早停参数 ---
-    parser.add_argument('--patience_cycles', type=int, default=2, help='早停: 验证集性能无提升的等待学习率周期数')
+    parser.add_argument('--patience_cycles', type=int, default=1, help='早停: 验证集性能无提升的等待学习率周期数')
     parser.add_argument('--overfit_gap_threshold', type=float, default=20.0, help='早停: 训练与验证准确率差距阈值')
     parser.add_argument('--overfit_check_epoch', type=int, default=20, help='开始检查过拟合的轮数')
     
@@ -115,7 +115,7 @@ def get_data_transforms(img_size=224):
     return train_transform, val_transform
 
 def load_pretrained_weights(model, weights_path, num_classes):
-    """加载预训练权重，并智能处理分类头不匹配的问题"""
+    """加载预训练权重，处理分类头不匹配的问题"""
     if os.path.isfile(weights_path):
         try:
             print(f"正在从 {weights_path} 加载预训练权重...")
@@ -214,10 +214,12 @@ def evaluate(model, data_loader, criterion, device, args):
     accuracy = 100. * total_correct.item() / total_samples
     return accuracy
 
+# 主函数
 if __name__ == '__main__':
     arg = parameter_setting()
     init_distributed_mode(arg)
     
+    # 保存的日志名称及模型训练结果路径
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
         writer = SummaryWriter('runs/SARatrX_Exp_CoaW')
@@ -265,7 +267,7 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = AdamW(model.parameters(), lr=arg.lr, weight_decay=arg.weight_decay)
     
-    #  "预热 + 余弦退火" 学习率调度器 ---
+    #  "预热 + 余弦退火" 学习率调度器
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6 / arg.lr, total_iters=arg.warmup_epochs)
     main_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=arg.T_0, T_mult=arg.T_mult, eta_min=arg.min_lr)
     scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[arg.warmup_epochs])
