@@ -311,11 +311,15 @@ def hivit_base(**kwargs):
     return model
 
 
-def HiViT_base(classes):
+def HiViT_base(classes, pretrained=True):
     model = HiViT(
         embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., in_chans=3, mlp_ratio=4.,
         num_classes=classes,
         ape=True, rpe=False, norm_layer=partial(nn.LayerNorm, eps=1e-6))
+
+    if not pretrained:
+        print("禁用预训练权重，返回一个随机初始化的模型")
+        return model
 
     pretrained_paths = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)),

@@ -218,10 +218,16 @@ class ResNet_50(torch.nn.Module):
 
 
 class convnext_1(torch.nn.Module):
-    def __init__(self, num_classes=3):
+    def __init__(self, num_classes=3, pretrained=True):
         super(convnext_1, self).__init__()
 
-        model = models.convnext_base(weights='IMAGENET1K_V1')
+        weights = 'IMAGENET1K_V1' if pretrained else None
+        if pretrained:
+            print("正在加载 ConvNeXt 预训练权重...")
+        else:
+            print("禁用预训练权重，返回一个随机初始化的 ConvNeXt 模型")
+            
+        model = models.convnext_base(weights=weights)
         # print(model)
         model.classifier[2] = nn.Linear(1024, num_classes)
         self.model = model

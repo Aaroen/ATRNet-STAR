@@ -83,7 +83,7 @@ def parameter_setting():
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
 
     # --- 预训练与断点续训 ---
-    parser.add_argument('--pretrained_weights', type=str, default='ATRBench/Classification/SARatrX/model/pretrained/mae_hivit_base_1600ep.pth', help='预训练权重文件路径 (可选)')
+    parser.add_argument('--pretrained_weights', type=str, default='', help='预训练权重文件路径 (可选)')
     parser.add_argument('--resume', type=str, default='', help='断点续训的 checkpoint 路径')
 
     # --- DDP 相关参数 ---
@@ -243,7 +243,7 @@ def main():
 
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/SARatrX_Exp_CosA') if not arg.test_only else None
+        writer = SummaryWriter('runs/SARatrX_Exp_nopre') if not arg.test_only else None
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)

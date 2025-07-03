@@ -65,7 +65,7 @@ def parameter_setting():
     parser.add_argument('--data_path', type=str, default='../../datasets/SOC_50classes/', help='数据集路径')
     parser.add_argument('--epochs', type=int, default=256, help='训练总轮数')
     parser.add_argument('--classes', type=int, default=50, help='类别数量')
-    parser.add_argument('--batch_size', type=int, default=188, help='单个GPU的批处理大小')
+    parser.add_argument('--batch_size', type=int, default=128, help='单个GPU的批处理大小')
     parser.add_argument('--workers', type=int, default=8, help='数据加载的工作线程数')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像尺寸')
@@ -84,6 +84,7 @@ def parameter_setting():
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
 
     # --- 预训练与数据增强参数 ---
+    parser.add_argument('--no_pretrain', action='store_true', help='禁用模型内部硬编码的预训练权重')
     parser.add_argument('--pretrained_weights_url', type=str,
                         default='',
                         help='预训练权重（留空则使用本地文件）')
@@ -234,7 +235,7 @@ def main():
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
         # 根据是否为测试模式决定是否创建 writer
-        writer = SummaryWriter('runs/HiViT_Up_CosA') if not arg.test_only else None
+        writer = SummaryWriter('runs/HiViT_Nonepre_CosA') if not arg.test_only else None
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -267,7 +268,7 @@ def main():
         print(f"训练集: {len(train_set)}, 验证集: {len(val_set)}, 测试集: {len(test_set)}")
 
     # 创建模型
-    model = HiViT_base(arg.classes).to(device)
+    model = HiViT_base(arg.classes, pretrained=not arg.no_pretrain).to(device)
     
     if arg.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[arg.gpu])

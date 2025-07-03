@@ -85,6 +85,9 @@ def parameter_setting():
     # --- 训练稳定性参数 ---
     parser.add_argument('--clip_grad', type=float, default=1.0, help='梯度裁剪阈值 (<=0 表示不裁剪)')
 
+    # --- 预训练控制 ---
+    parser.add_argument('--no_pretrain', action='store_true', help='禁用模型内部硬编码的预训练权重')
+
     # --- DDP 相关参数 ---
     parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
     parser.add_argument('--resume', default='', type=str, help='要恢复训练的检查点路径')
@@ -202,7 +205,7 @@ if __name__ == '__main__':
     
     if arg.rank == 0:
         os.makedirs('./results/', exist_ok=True)
-        writer = SummaryWriter('runs/ConvNeXt_Up_CosA')
+        writer = SummaryWriter('runs/ConvNeXt_Up_nopre')
 
     torch.manual_seed(arg.seed)
     np.random.seed(arg.seed)
@@ -235,7 +238,7 @@ if __name__ == '__main__':
         print(f"训练集: {len(train_set)}, 验证集: {len(val_set)}, 测试集: {len(test_set)}")
 
     # 模型、优化器和调度器初始化
-    model = convnext_1(num_classes=arg.classes).to(device)
+    model = convnext_1(num_classes=arg.classes, pretrained=not arg.no_pretrain).to(device)
     
     if arg.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[arg.gpu])
