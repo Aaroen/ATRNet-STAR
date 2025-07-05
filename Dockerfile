@@ -1,5 +1,7 @@
+# podman版
+
 # 1. 使用官方 NVIDIA CUDA 基础镜像
-FROM nvidia/cuda:12.1.1-base-ubuntu22.04
+FROM docker.io/nvidia/cuda:12.1.1-base-ubuntu22.04
 
 # 设置环境变量，避免安装过程中的交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
