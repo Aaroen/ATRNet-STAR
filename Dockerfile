@@ -43,6 +43,7 @@ RUN . /opt/conda/etc/profile.d/conda.sh && conda activate base && \
     # --- 核心与环境 ---
     python=3.11 \
     jupyterlab \
+    pytz \
     \
     # --- PyTorch 生态 ---
     pytorch torchvision torchaudio pytorch-cuda=12.1 \

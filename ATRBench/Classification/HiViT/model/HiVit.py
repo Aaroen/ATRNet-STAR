@@ -1,15 +1,12 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.layers.drop import DropPath
 from timm.layers.mlp import Mlp
 from timm.layers.helpers import to_2tuple
 from timm.layers.weight_init import trunc_normal_
-
 from functools import partial
-import os
 
 
 class Attention(nn.Module):
@@ -28,7 +25,7 @@ class Attention(nn.Module):
         if rpe:
             coords_h = torch.arange(input_size)
             coords_w = torch.arange(input_size)
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
             coords_flatten = torch.flatten(coords, 1)
             relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
             relative_coords = relative_coords.permute(1, 2, 0).contiguous()
@@ -49,20 +46,21 @@ class Attention(nn.Module):
     def forward(self, x, rpe_index=None, mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        if rpe_index is not None:
-            rpe_index = self.relative_position_index.view(-1)
-            S = int(math.sqrt(rpe_index.size(-1)))
-            relative_position_bias = self.relative_position_bias_table[rpe_index].view(-1, S, S, self.num_heads)
-            relative_position_bias = relative_position_bias.permute(0, 3, 1, 2).contiguous()
-            attn = attn + relative_position_bias
+        if self.relative_position_bias_table is not None:
+            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+                self.input_size * self.input_size, self.input_size * self.input_size, -1)
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+            attn = attn + relative_position_bias.unsqueeze(0)
+
         if mask is not None:
             mask = mask.bool()
             attn = attn.masked_fill(~mask[:, None, None, :], float("-inf"))
+        
         attn = self.softmax(attn)
         attn = self.attn_drop(attn)
 
@@ -171,7 +169,7 @@ class PatchMerge(nn.Module):
 
 class HiViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, inner_patches=4, in_chans=3, num_classes=1000,
-                 embed_dim=512, depths=[4, 4, 19], num_heads=8, stem_mlp_ratio=3., mlp_ratio=4.,
+                 embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., mlp_ratio=4.,
                  qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.0,
                  norm_layer=nn.LayerNorm, ape=True, rpe=True, patch_norm=True, use_checkpoint=False,
                  kernel_size=None, pad_size=None,
@@ -239,6 +237,7 @@ class HiViT(nn.Module):
                 embed_dim *= 2
         if self.num_layers > 3:
             self.num_features *= 2
+        
         self.fc_norm = norm_layer(self.num_features)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -306,64 +305,14 @@ class HiViT(nn.Module):
         x = self.head(x)
         return x
 
-
-def hivit_base(**kwargs):
+def HiViT_base(num_classes, **kwargs):
+    """
+    HiViT-Base model constructor.
+    This function is only responsible for creating the model architecture,
+    without any weight loading or modification logic.
+    """
     model = HiViT(
-        embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., mlp_ratio=4.,
-        rpe=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., in_chans=3, mlp_ratio=4.,
+        num_classes=num_classes,
+        ape=True, rpe=False, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-
-
-def HiViT_base(num_classes, pretrained=False):
-    model_kwargs = {
-        'embed_dim': 512, 
-        'depths': [2, 2, 20], 
-        'num_heads': 8, 
-        'stem_mlp_ratio': 3., 
-        'mlp_ratio': 4.,
-        'rpe': True, 
-        'norm_layer': partial(nn.LayerNorm, eps=1e-6),
-        'num_classes': num_classes
-    }
-    
-    if not pretrained:
-        model = HiViT(**model_kwargs)
-        return model
-
-    # --- 加载预训练权重逻辑 ---
-    
-    model_kwargs['num_classes'] = 1000
-    model = HiViT(**model_kwargs)
-    
-    current_path = os.path.abspath(os.path.dirname(__file__))
-    pretrained_path = os.path.join(current_path, 'pretrained/mae_hivit_base_1600ep.pth')
-    
-    if os.path.exists(pretrained_path):
-        print(f"找到并加载预训练模型: {pretrained_path}")
-        checkpoint = torch.load(pretrained_path, map_location='cpu')
-        
-        checkpoint_model = checkpoint.get('model', checkpoint)
-        checkpoint_model = {k.replace('module.', ''): v for k, v in checkpoint_model.items()}
-
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                del checkpoint_model[k]
-        
-        model.load_state_dict(checkpoint_model, strict=False)
-    else:
-        print(f"警告: 预训练权重文件 {pretrained_path} 未找到，将使用随机初始化的模型。")
-
-    # 如果目标类别数不是1000，则替换为新的分类头
-    if num_classes != 1000:
-        model.head = nn.Linear(model.num_features, num_classes)
-        # 初始化新的分类头
-        trunc_normal_(model.head.weight, std=.02)
-        if model.head.bias is not None:
-            nn.init.constant_(model.head.bias, 0)
-            
-    return model
-
-
-if __name__ == '__main__':
-    current_path = os.path.abspath(os.path.dirname(__file__))

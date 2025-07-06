@@ -222,10 +222,6 @@ class convnext_1(torch.nn.Module):
         super(convnext_1, self).__init__()
 
         weights = 'IMAGENET1K_V1' if pretrained else None
-        if pretrained:
-            print("正在加载 ConvNeXt 预训练权重...")
-        else:
-            print("禁用预训练权重，返回一个随机初始化的 ConvNeXt 模型")
             
         model = models.convnext_base(weights=weights)
         # print(model)
