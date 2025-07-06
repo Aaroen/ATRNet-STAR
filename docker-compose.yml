@@ -1,3 +1,4 @@
+name: aroen
 services:
   # 服务名，现在是统一的命名
   aroen_atrbench:
