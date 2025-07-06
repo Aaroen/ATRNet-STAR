@@ -24,7 +24,7 @@ services:
 
     # 挂载卷
     volumes:
-      - ~/AroenLan:/AroenLan
+      - ~/AroenLan:/root/AroenLan
       - ~/.gitconfig:/root/.gitconfig:ro
       - ~/.ssh:/root/.ssh:ro
       

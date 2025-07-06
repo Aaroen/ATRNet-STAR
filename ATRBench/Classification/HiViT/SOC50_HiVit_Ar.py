@@ -128,7 +128,6 @@ def load_pretrained_weights(model, url, num_classes):
         print(f"正在从 {url} 加载预训练权重...")
         checkpoint = torch.hub.load_state_dict_from_url(url, map_location='cpu', check_hash=True)
         
-        # 官方权重文件可能包含 'model' 键
         if 'model' in checkpoint:
             checkpoint = checkpoint['model']
 
@@ -360,8 +359,7 @@ def main():
     if arg.distributed:
         dist.barrier()
 
-    # --- 最终测试 ---
-    # 在所有进程上确定要测试的 checkpoint 路径
+    # --- 测试 ---
     if arg.test_only:
         ckpt_path = arg.test_checkpoint
         if not ckpt_path:
@@ -395,7 +393,7 @@ def main():
         checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
 
         # 2. 创建模型并移动到各进程对应的 GPU
-        test_model = HiViT_base(arg.classes).to(device)
+        test_model = HiViT_base(arg.classes, pretrained=False).to(device)
 
         # 3. 如果是DDP，先用 DDP 包裹模型
         if arg.distributed:
@@ -403,10 +401,31 @@ def main():
 
         # 4. 将权重加载到模型中
         model_to_load = test_model.module if arg.distributed else test_model
+        
+        # 确定要加载的实际 state_dict
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            state_dict_to_load = checkpoint['model_state_dict']
         else:
-            model_to_load.load_state_dict(checkpoint, strict=False)
+            state_dict_to_load = checkpoint
+            
+        # 检查并转换旧格式的键名
+        if 'head.1.weight' in state_dict_to_load:
+            if arg.rank == 0:
+                print("检测到旧版模型格式，正在进行权重键名转换...")
+            new_state_dict = {}
+            for k, v in state_dict_to_load.items():
+                if k == 'head.1.weight':
+                    new_state_dict['head.weight'] = v
+                elif k == 'head.1.bias':
+                    new_state_dict['head.bias'] = v
+                elif 'head.0' not in k: # 忽略旧BN层的参数
+                    new_state_dict[k] = v
+            final_checkpoint = new_state_dict
+        else:
+            final_checkpoint = state_dict_to_load
+
+        # 加载最终处理好的权重
+        model_to_load.load_state_dict(final_checkpoint, strict=False)
         
         # 5. 创建测试数据加载器
         test_sampler = DistributedSampler(test_set, shuffle=False) if arg.distributed else None
@@ -431,5 +450,5 @@ def main():
     cleanup()
 
 if __name__ == '__main__':
-    # 将主逻辑移入 main 函数，便于组织和管理
     main()
+    

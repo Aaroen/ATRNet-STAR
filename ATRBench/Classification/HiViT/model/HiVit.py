@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, Mlp, to_2tuple, trunc_normal_
+from timm.layers.drop import DropPath
+from timm.layers.mlp import Mlp
+from timm.layers.helpers import to_2tuple
+from timm.layers.weight_init import trunc_normal_
 
 from functools import partial
 import os
@@ -311,98 +314,56 @@ def hivit_base(**kwargs):
     return model
 
 
-def HiViT_base(classes, pretrained=True):
-    model = HiViT(
-        embed_dim=512, depths=[2, 2, 20], num_heads=8, stem_mlp_ratio=3., in_chans=3, mlp_ratio=4.,
-        num_classes=classes,
-        ape=True, rpe=False, norm_layer=partial(nn.LayerNorm, eps=1e-6))
-
+def HiViT_base(num_classes, pretrained=False):
+    model_kwargs = {
+        'embed_dim': 512, 
+        'depths': [2, 2, 20], 
+        'num_heads': 8, 
+        'stem_mlp_ratio': 3., 
+        'mlp_ratio': 4.,
+        'rpe': True, 
+        'norm_layer': partial(nn.LayerNorm, eps=1e-6),
+        'num_classes': num_classes
+    }
+    
     if not pretrained:
-        print("禁用预训练权重，返回一个随机初始化的模型")
+        model = HiViT(**model_kwargs)
         return model
 
-    pretrained_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     'pretrained', 'mae_hivit_base_1600ep.pth'),
-    ]
+    # --- 加载预训练权重逻辑 ---
     
-    checkpoint = None
-    for path in pretrained_paths:
-        if os.path.exists(path):
-            print(f"找到预训练模型: {path}")
-            try:
-                checkpoint = torch.load(path, map_location='cpu', weights_only=True)
-                break
-            except Exception as e:
-                print(f"加载模型 {path} 失败: {e}")
+    model_kwargs['num_classes'] = 1000
+    model = HiViT(**model_kwargs)
     
-    if checkpoint is None:
-        print("警告: 未找到预训练模型文件，将使用随机初始化的模型")
-        return model
+    current_path = os.path.abspath(os.path.dirname(__file__))
+    pretrained_path = os.path.join(current_path, 'pretrained/mae_hivit_base_1600ep.pth')
+    
+    if os.path.exists(pretrained_path):
+        print(f"找到并加载预训练模型: {pretrained_path}")
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+        
+        checkpoint_model = checkpoint.get('model', checkpoint)
+        checkpoint_model = {k.replace('module.', ''): v for k, v in checkpoint_model.items()}
 
-    # checkpoint = checkpoint['model']
+        state_dict = model.state_dict()
+        for k in ['head.weight', 'head.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                del checkpoint_model[k]
+        
+        model.load_state_dict(checkpoint_model, strict=False)
+    else:
+        print(f"警告: 预训练权重文件 {pretrained_path} 未找到，将使用随机初始化的模型。")
 
-    checkpoint_model = {k.replace('module.', ''): v for k, v in checkpoint.items()}
-    state_dict = model.state_dict()
-    for k in ['head.weight', 'head.bias']:
-        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-            print(f"Removing key {k} from pretrained checkpoint")
-            del checkpoint_model[k]
-    # load pre-trained model
-    # print('load pre-trained model')
-    # interpolate_pos_embed(model, checkpoint_model)
-    # load pre-trained model
-    msg = model.load_state_dict(checkpoint_model, strict=False)
-    # assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-    # print(msg)
-
-    # manually initialize fc layer: following MoCo v3
-    from timm.models.layers import trunc_normal_
-
-    trunc_normal_(model.head.weight, std=0.01)
-
-    # for linear prob only
-    # hack: revise model's head with BN
-    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6),
-                                     model.head)
-    # freeze all but the head
-    for name, p in model.named_parameters():
-        p.requires_grad = False
-        if 'blocks.14' in name:
-            p.requires_grad_(True)
-        if 'blocks.15' in name:
-            p.requires_grad_(True)
-        if 'blocks.16' in name:
-            p.requires_grad_(True)
-        if 'blocks.17' in name:
-            p.requires_grad_(True)
-        if 'blocks.18' in name:
-            p.requires_grad_(True)
-        if 'blocks.19' in name:
-            p.requires_grad_(True)
-        if 'blocks.20' in name:
-            p.requires_grad_(True)
-        if 'blocks.21' in name:
-            p.requires_grad_(True)
-        if 'blocks.22' in name:
-            p.requires_grad_(True)
-        if 'blocks.23' in name:
-            p.requires_grad_(True)
-        if 'blocks.24' in name:
-            p.requires_grad_(True)
-        if 'blocks.25' in name:
-            p.requires_grad_(True)
-        if 'blocks.26' in name:
-            p.requires_grad_(True)
-        if 'blocks.27' in name:
-            p.requires_grad_(True)
-        if 'blocks.28' in name:
-            p.requires_grad_(True)
-        if 'blocks.29' in name:
-            p.requires_grad_(True)
-    for _, p in model.fc_norm.named_parameters():
-        p.requires_grad = True
-    for _, p in model.head.named_parameters():
-        p.requires_grad = True
-
+    # 如果目标类别数不是1000，则替换为新的分类头
+    if num_classes != 1000:
+        model.head = nn.Linear(model.num_features, num_classes)
+        # 初始化新的分类头
+        trunc_normal_(model.head.weight, std=.02)
+        if model.head.bias is not None:
+            nn.init.constant_(model.head.bias, 0)
+            
     return model
+
+
+if __name__ == '__main__':
+    current_path = os.path.abspath(os.path.dirname(__file__))
