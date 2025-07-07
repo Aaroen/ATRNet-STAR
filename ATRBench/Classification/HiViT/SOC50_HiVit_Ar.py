@@ -394,10 +394,10 @@ def main(arg, device):
             tqdm.write(f"Epoch {epoch+1}/{arg.epochs} -> Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
             if writer:
                 writer.add_scalar('Loss/train', train_loss, epoch)
-                writer.add_scalar('Loss/val', val_loss, epoch)
+                writer.add_scalar('Loss/validation', val_loss, epoch)
                 writer.add_scalar('Accuracy/train', train_acc, epoch)
-                writer.add_scalar('Accuracy/val', val_acc, epoch)
-                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+                writer.add_scalar('Accuracy/validation', val_acc, epoch)
+                writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
