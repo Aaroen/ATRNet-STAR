@@ -87,9 +87,9 @@ def parameter_setting():
     parser.add_argument('--dist_url', default='env://', help='DDP 使用的 URL')
     
     # --- 恢复与测试 ---
-    parser.add_argument('--model_path', default='', type=str, help='模型检查点路径，用于恢复训练或测试')
+    parser.add_argument('--model_path', default='results/SARatrX_HiViT/SOC_50classes_SARatrX_SGDR_95074.pth', type=str, help='模型检查点路径，用于恢复训练或测试')
     parser.add_argument('--resume', default=False, action='store_true', help='是否从检查点恢复训练 (默认为False, 需使用 --model_path 指定路径)')
-    parser.add_argument('--test_only', default=False, action='store_true', help='仅运行测试模式 (默认为False, 需使用 --model_path 指定路径)')
+    parser.add_argument('--test_only', default=True, action='store_true', help='仅运行测试模式 (默认为False, 需使用 --model_path 指定路径)')
     
     args = parser.parse_args()
     return args
